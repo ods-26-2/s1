@@ -1,0 +1,27 @@
+[
+  {
+    "message_type": "event",
+    "schema": "ods.inferencia.calibracao",
+    "schema_version": "1.0",
+    "producer": "I3",
+    "published_at": "2026-09-01T00:00:00.500Z",
+    "payload": {
+      "camera_id": "cam_frontal",
+      "calibration_version": "calib-frontal-v1",
+      "valid_from": "2026-09-01T00:00:00.000Z",
+      "homography": [
+        [0.1, 0.0, 0.0],
+        [0.0, 0.1, 0.0],
+        [0.0, 0.0, 1.0]
+      ],
+      "reference_frame": {
+        "space_id": "galpao_principal",
+        "origin": "canto_inferior_esquerdo_planta",
+        "axes": "x_direita_y_cima",
+        "unit": "metros"
+      },
+      "reprojection_rms_cm": 1.8,
+      "holdout_points": 12
+    }
+  }
+]

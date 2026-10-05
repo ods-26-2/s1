@@ -1,0 +1,117 @@
+[
+  {
+    "message_type": "event",
+    "schema": "ods.inferencia.rastreio",
+    "schema_version": "1.0",
+    "producer": "I2",
+    "published_at": "2026-09-16T10:47:28.150Z",
+    "payload": {
+      "camera_id": "cam_frontal",
+      "session_id": "sess_001",
+      "captured_at": "2026-09-16T10:47:28.100Z",
+      "frame": 100,
+      "tracks": [
+        {
+          "track_id": 1,
+          "class": "person",
+          "state": "confirmed",
+          "u_px": 509.0,
+          "v_px": 250.0,
+          "predicted": false
+        }
+      ]
+    }
+  },
+  {
+    "message_type": "event",
+    "schema": "ods.inferencia.rastreio",
+    "schema_version": "1.0",
+    "producer": "I2",
+    "published_at": "2026-09-16T10:47:28.250Z",
+    "payload": {
+      "camera_id": "cam_frontal",
+      "session_id": "sess_001",
+      "captured_at": "2026-09-16T10:47:28.200Z",
+      "frame": 101,
+      "tracks": [
+        {
+          "track_id": 1,
+          "class": "person",
+          "state": "confirmed",
+          "u_px": 511.0,
+          "v_px": 250.0,
+          "predicted": false
+        }
+      ]
+    }
+  },
+  {
+    "message_type": "event",
+    "schema": "ods.inferencia.rastreio",
+    "schema_version": "1.0",
+    "producer": "I2",
+    "published_at": "2026-09-16T10:47:28.350Z",
+    "payload": {
+      "camera_id": "cam_frontal",
+      "session_id": "sess_001",
+      "captured_at": "2026-09-16T10:47:28.300Z",
+      "frame": 102,
+      "tracks": [
+        {
+          "track_id": 1,
+          "class": "person",
+          "state": "confirmed",
+          "u_px": 508.0,
+          "v_px": 250.0,
+          "predicted": false
+        }
+      ]
+    }
+  },
+  {
+    "message_type": "event",
+    "schema": "ods.inferencia.rastreio",
+    "schema_version": "1.0",
+    "producer": "I2",
+    "published_at": "2026-09-16T10:47:28.450Z",
+    "payload": {
+      "camera_id": "cam_frontal",
+      "session_id": "sess_001",
+      "captured_at": "2026-09-16T10:47:28.400Z",
+      "frame": 103,
+      "tracks": [
+        {
+          "track_id": 99,
+          "class": "person",
+          "state": "confirmed",
+          "u_px": 100.0,
+          "v_px": 100.0,
+          "predicted": false
+        }
+      ]
+    }
+  },
+  {
+    "message_type": "event",
+    "schema": "ods.inferencia.rastreio",
+    "schema_version": "1.0",
+    "producer": "I2",
+    "published_at": "2026-09-16T10:47:28.550Z",
+    "payload": {
+      "camera_id": "cam_frontal",
+      "session_id": "sess_001",
+      "captured_at": "2026-09-16T10:47:28.500Z",
+      "frame": 104,
+      "tracks": [
+        {
+          "track_id": 99,
+          "class": "person",
+          "state": "confirmed",
+          "u_px": 150.0,
+          "v_px": 100.0,
+          "predicted": false
+        }
+      ]
+    }
+  }
+]

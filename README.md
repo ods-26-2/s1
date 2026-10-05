@@ -1,4 +1,4 @@
-# Trabalho ODS — Equipe VER-6
+# Trabalho ODS — Equipe VER-6 — Componente S1
 
 Implementação do componente **S1 — Zonas, ocupação e eventos**
 
@@ -118,7 +118,7 @@ pip install -r requirements.txt
 # Demonstração: eventos de I2 (data/i2_eventos.json) + calibração de
 # I3 (data/i3_calibracoes.json) — combina os dois casos da Sprint 2: um
 # objeto oscilando na borda (histerese suprime) e o "Objeto 99" entrando
-# de fato na Zona Segura (zone_id/transition aparecem na saída)
+# de fato na Zona Segura
 python simulate.py
 
 # Testes

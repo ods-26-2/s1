@@ -26,7 +26,7 @@ Implementação do componente **S1 — Zonas, ocupação e eventos**
   (`HysteresisController` em `s1/domain.py`).
 - **Ocupação**: contagem instantânea de entidades confirmadas por zona,
   exposta em cada evento e via `S1Service.occupancy_snapshot()`.
-- **Saída publicada**: além do `ZoneEvent` interno (mais rico, para A3), o
+- **Saída publicada**: além do `ZoneEvent` interno, o
   simulador grava um JSON com as mensagens `ods.visao.evento_espacial`
   publicadas pelo S1 — uma por leitura processada (`s1/output.py`).
 
@@ -58,8 +58,7 @@ I3 (homografia, por câmera)   ─┘                                           
    `(x/w, y/w)`.
 4. O `track_id` de I2 é **local à câmera**. Por isso o `entity_id` usado
    pelo S1 é `"{camera_id}:{track_id}"` — duas câmeras observando a mesma
-   entidade física gerariam dois `entity_id` diferentes. **A fusão entre
-   fontes (deduplicação) é responsabilidade do S2**, não do S1.
+   entidade física gerariam dois `entity_id` diferentes.
 5. O `TrajectoryPoint` resultante segue para o `S1Service` carregando as
    duas representações possíveis: `pixel_position` (sempre) e
    `world_position` (só quando havia calibração vigente para projetar).
@@ -190,36 +189,9 @@ Essa conversão é feita por `to_spatial_event()` em `s1/output.py`. O formato
 de `transition` não veio detalhado no contrato (campo `object` genérico) —
 a tabela acima é a convenção adotada.
 
-## Formato dos eventos de entrada (I2 e I3)
-
-Envelope comum a ambos:
-
-```json
-{
-  "message_type": "event",
-  "schema": "ods.inferencia.rastreio | ods.inferencia.calibracao",
-  "schema_version": "1.0",
-  "producer": "I2 | I3",
-  "published_at": "<ISO-8601>",
-  "payload": { "...": "..." }
-}
-```
-
-- **I2 (`ods.inferencia.rastreio`)**: `payload.tracks[]` traz, por câmera e
-  por frame, `track_id` (local à câmera), `class`, `state`, `u_px`/`v_px`
-  (pixel) e `predicted`.
-- **I3 (`ods.inferencia.calibracao`)**: `payload.homography` é a matriz 3x3
-  que projeta pixel → mundo para aquela câmera, válida a partir de
-  `valid_from` (pode haver recalibração: o `CalibrationRegistry` sempre
-  escolhe a versão vigente no instante da captura).
-
-O parsing em `s1/ingestion.py` valida o campo `schema` de cada mensagem e
-rejeita (`SchemaMismatchError`) uma mensagem do schema errado.
-
 ## Formato interno (`ZoneEvent`)
 
-Estrutura usada internamente pelo `S1Service` (mais rica que a mensagem
-publicada — carrega ocupação, risco/cor da zona etc., úteis para A3). Junto
+Estrutura usada internamente pelo `S1Service`. Junto
 com o `TrajectoryPoint` de origem, é o que `to_spatial_event()` consome
 para montar a mensagem `ods.visao.evento_espacial`.
 

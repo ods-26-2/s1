@@ -1,0 +1,86 @@
+[
+  {
+    "message_type": "event",
+    "schema": "ods.visao.evento_espacial",
+    "schema_version": "1.0",
+    "producer": "S1",
+    "published_at": "2026-09-16T10:47:28.100Z",
+    "payload": {
+      "entity_id": "cam_frontal:1",
+      "source_id": "cam_frontal",
+      "timestamp": "2026-09-16T10:47:28.100Z",
+      "world_coordinates": {
+        "x": 50.9,
+        "y": 25.0
+      }
+    }
+  },
+  {
+    "message_type": "event",
+    "schema": "ods.visao.evento_espacial",
+    "schema_version": "1.0",
+    "producer": "S1",
+    "published_at": "2026-09-16T10:47:28.200Z",
+    "payload": {
+      "entity_id": "cam_frontal:1",
+      "source_id": "cam_frontal",
+      "timestamp": "2026-09-16T10:47:28.200Z",
+      "world_coordinates": {
+        "x": 51.1,
+        "y": 25.0
+      }
+    }
+  },
+  {
+    "message_type": "event",
+    "schema": "ods.visao.evento_espacial",
+    "schema_version": "1.0",
+    "producer": "S1",
+    "published_at": "2026-09-16T10:47:28.300Z",
+    "payload": {
+      "entity_id": "cam_frontal:1",
+      "source_id": "cam_frontal",
+      "timestamp": "2026-09-16T10:47:28.300Z",
+      "world_coordinates": {
+        "x": 50.8,
+        "y": 25.0
+      }
+    }
+  },
+  {
+    "message_type": "event",
+    "schema": "ods.visao.evento_espacial",
+    "schema_version": "1.0",
+    "producer": "S1",
+    "published_at": "2026-09-16T10:47:28.400Z",
+    "payload": {
+      "entity_id": "cam_frontal:99",
+      "source_id": "cam_frontal",
+      "timestamp": "2026-09-16T10:47:28.400Z",
+      "world_coordinates": {
+        "x": 10.0,
+        "y": 10.0
+      }
+    }
+  },
+  {
+    "message_type": "event",
+    "schema": "ods.visao.evento_espacial",
+    "schema_version": "1.0",
+    "producer": "S1",
+    "published_at": "2026-09-16T10:47:28.500Z",
+    "payload": {
+      "entity_id": "cam_frontal:99",
+      "source_id": "cam_frontal",
+      "timestamp": "2026-09-16T10:47:28.500Z",
+      "world_coordinates": {
+        "x": 15.0,
+        "y": 10.0
+      },
+      "zone_id": "zona_segura_01",
+      "transition": {
+        "type": "entrada"
+      }
+    }
+  }
+]

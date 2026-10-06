@@ -1,0 +1,30 @@
+{
+  "zonas": [
+    {
+      "zone_id": "zona_segura_01",
+      "nome_amigavel": "Recepção",
+      "poligono": [
+        {"x": 0.0, "y": 0.0}, {"x": 50.0, "y": 0.0},
+        {"x": 50.0, "y": 50.0}, {"x": 0.0, "y": 50.0}
+      ],
+      "risco": "Segura",
+      "cor_dashboard": "Verde",
+      "sistema_coordenadas": "mundo",
+      "camera_id": null,
+      "versao_transformacao": null
+    },
+    {
+      "zone_id": "zona_proibida_01",
+      "nome_amigavel": "Portão Sul",
+      "poligono": [
+        {"x": 51.0, "y": 0.0}, {"x": 100.0, "y": 0.0},
+        {"x": 100.0, "y": 50.0}, {"x": 51.0, "y": 50.0}
+      ],
+      "risco": "Critico",
+      "cor_dashboard": "Vermelho",
+      "sistema_coordenadas": "mundo",
+      "camera_id": null,
+      "versao_transformacao": null
+    }
+  ]
+}

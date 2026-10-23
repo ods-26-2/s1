@@ -1,299 +1,222 @@
-"""Ingestão do S1: transforma as mensagens de I2/I3 em `TrajectoryPoint`.
+"""Entrada do S1: contratos consumidos e artefatos carregados.
 
-Reúne o parsing dos envelopes de mensagem, a projeção pixel -> mundo
-via homografia, o registro de calibrações por câmera e o carregamento
-dos artefatos JSON de entrada (zonas, eventos de I2, calibrações de I3).
+Mensagens (Especificação de interfaces 1.0, arquitetura 6c), todas no
+envelope comum — câmera, sessão e tempo de captura vêm no envelope:
 
-Cada mensagem de I2/I3 chega como um envelope comum:
+- `ods.i2.tracks`: rastros de um quadro de uma câmera.
+- `ods.i3.calibration`: conteúdo de um artefato CALIBRATION publicado.
+- `ods.session.started`: início de sessão (ao vivo, ou replay após
+  START/SEEK/LOOP/RESTART).
+- `ods.artifact.published`: anúncio de nova versão de artefato.
 
-    {
-      "message_type": "event",
-      "schema": "ods.inferencia.rastreio" | "ods.inferencia.calibracao",
-      "schema_version": "1.0",
-      "producer": "I2" | "I3",
-      "published_at": "<ISO-8601>",
-      "payload": {...}
-    }
+Artefatos (registro de B5, imutáveis e versionados): ZONES e CALIBRATION.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Tuple, Union
 
-from .domain import Point, TrajectoryPoint, Zone
+from .domain import Calibration, Frame, Homography, Point, TrackObservation, Zone, ZonesArtifact
 
 PathLike = Union[str, Path]
 
-I2_TRACK_SCHEMA = "ods.inferencia.rastreio"
-I3_CALIBRATION_SCHEMA = "ods.inferencia.calibracao"
+I2_TRACKS = "ods.i2.tracks"
+I3_CALIBRATION = "ods.i3.calibration"
+SESSION_STARTED = "ods.session.started"
+ARTIFACT_PUBLISHED = "ods.artifact.published"
 
-def _parse_timestamp(value: str) -> datetime:
+_TRACK_STATES = ("CONFIRMED", "LOST")
+
+
+class ContractError(ValueError):
+    """Mensagem ou artefato fora do contrato."""
+
+
+def parse_timestamp(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
-# --------------------------------------------------------------------------
-# Parsing e validação dos envelopes de I2 (rastreio) e I3 (calibração).
-# --------------------------------------------------------------------------
 
-class SchemaMismatchError(ValueError):
-    """A mensagem recebida não corresponde ao schema esperado."""
+def _require(obj: Dict, key: str, where: str):
+    if obj.get(key) is None:
+        raise ContractError(f"{where}: campo obrigatório {key!r} ausente")
+    return obj[key]
 
-def _assert_schema(message: Dict, expected_schema: str) -> None:
-    schema = message.get("schema")
-    if schema != expected_schema:
-        raise SchemaMismatchError(
-            f"esperado schema {expected_schema!r}, recebido {schema!r}"
-        )
 
-@dataclass(frozen=True)
-class RawTrack:
-    """Um track dentro do payload de um evento de rastreio (I2)."""
+def _require_int(obj: Dict, key: str, where: str) -> int:
+    value = _require(obj, key, where)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ContractError(f"{where}: {key!r} deve ser inteiro, recebido {value!r}")
+    return value
 
-    track_id: int
-    object_class: str
-    state: str
-    u_px: float
-    v_px: float
-    predicted: bool
 
-@dataclass(frozen=True)
-class TrackEvent:
-    """Payload de um evento `ods.inferencia.rastreio` (I2), já validado."""
-
-    camera_id: str
-    session_id: str
-    captured_at: datetime
-    frame: Optional[int]
-    tracks: List[RawTrack]
-    published_at: datetime
-
-@dataclass(frozen=True)
-class ReferenceFrame:
-    space_id: str
-    origin: str
-    axes: str
-    unit: str
-
-@dataclass(frozen=True)
-class CalibrationEvent:
-    """Payload de um evento `ods.inferencia.calibracao` (I3), já validado."""
-
-    camera_id: str
-    calibration_version: str
-    valid_from: datetime
-    homography: List[List[float]]
-    reference_frame: ReferenceFrame
-    reprojection_rms_cm: float
-    holdout_points: int
-    published_at: datetime
-
-def parse_track_event(message: Dict) -> TrackEvent:
-    _assert_schema(message, I2_TRACK_SCHEMA)
-    payload = message["payload"]
-    tracks = [
-        RawTrack(
-            track_id=track["track_id"],
-            object_class=track["class"],
-            state=track["state"],
-            u_px=track["u_px"],
-            v_px=track["v_px"],
-            predicted=track["predicted"],
-        )
-        for track in payload["tracks"]
-    ]
-    return TrackEvent(
-        camera_id=payload["camera_id"],
-        session_id=payload["session_id"],
-        captured_at=_parse_timestamp(payload["captured_at"]),
-        frame=payload.get("frame"),
-        tracks=tracks,
-        published_at=_parse_timestamp(message["published_at"]),
-    )
-
-def parse_calibration_event(message: Dict) -> CalibrationEvent:
-    _assert_schema(message, I3_CALIBRATION_SCHEMA)
-    payload = message["payload"]
-    reference_frame = payload["reference_frame"]
-    return CalibrationEvent(
-        camera_id=payload["camera_id"],
-        calibration_version=payload["calibration_version"],
-        valid_from=_parse_timestamp(payload["valid_from"]),
-        homography=payload["homography"],
-        reference_frame=ReferenceFrame(
-            space_id=reference_frame["space_id"],
-            origin=reference_frame["origin"],
-            axes=reference_frame["axes"],
-            unit=reference_frame["unit"],
-        ),
-        reprojection_rms_cm=payload["reprojection_rms_cm"],
-        holdout_points=payload["holdout_points"],
-        published_at=_parse_timestamp(message["published_at"]),
-    )
-
-# --------------------------------------------------------------------------
-# Homografia: projeção de pixel para coordenadas de mundo.
-# [x', y', w']ᵀ = H · [u, v, 1]ᵀ, ponto final em (x'/w', y'/w').
-# --------------------------------------------------------------------------
-
-class DegenerateHomographyError(ValueError):
-    """A homografia projeta o ponto para o infinito (w = 0)."""
-
-class Homography:
-    def __init__(self, matrix: List[List[float]]):
-        if len(matrix) != 3 or any(len(row) != 3 for row in matrix):
-            raise ValueError("homografia deve ser uma matriz 3x3")
-        self._matrix = matrix
-
-    def project(self, u_px: float, v_px: float) -> Point:
-        h = self._matrix
-        x = h[0][0] * u_px + h[0][1] * v_px + h[0][2]
-        y = h[1][0] * u_px + h[1][1] * v_px + h[1][2]
-        w = h[2][0] * u_px + h[2][1] * v_px + h[2][2]
-        if w == 0:
-            raise DegenerateHomographyError(
-                f"homografia degenerada: w=0 para o pixel ({u_px}, {v_px})"
-            )
-        # Arredonda para evitar ruído de ponto flutuante (ex: 50.900000000000006)
-        # na saída publicada, sem perda de precisão prática (unidade: metros).
-        return Point(round(x / w, 6), round(y / w, 6))
-
-# --------------------------------------------------------------------------
-# Registro de calibrações por câmera. I3 pode publicar uma nova versão
-# ao longo do tempo (recalibração); para cada leitura de I2, resolvemos
-# qual calibração estava vigente na câmera no instante da captura (a de
-# `valid_from` mais recente que ainda seja `<= captured_at`).
-# --------------------------------------------------------------------------
-
-class CalibrationNotFoundError(LookupError):
-    """Nenhuma calibração vigente foi encontrada para a câmera/instante."""
-
-@dataclass(frozen=True)
-class Calibration:
-    camera_id: str
-    calibration_version: str
-    valid_from: datetime
-    homography: Homography
-    reference_frame: ReferenceFrame
-
-class CalibrationRegistry:
-    def __init__(self) -> None:
-        self._by_camera: Dict[str, List[Calibration]] = {}
-
-    def register(self, event: CalibrationEvent) -> None:
-        calibration = Calibration(
-            camera_id=event.camera_id,
-            calibration_version=event.calibration_version,
-            valid_from=event.valid_from,
-            homography=Homography(event.homography),
-            reference_frame=event.reference_frame,
-        )
-        entries = self._by_camera.setdefault(event.camera_id, [])
-        entries.append(calibration)
-        entries.sort(key=lambda c: c.valid_from)
-
-    def register_many(self, events: List[CalibrationEvent]) -> None:
-        for event in events:
-            self.register(event)
-
-    def resolve(self, camera_id: str, at: datetime) -> Calibration:
-        current: Optional[Calibration] = None
-        for calibration in self._by_camera.get(camera_id, []):
-            if calibration.valid_from <= at:
-                current = calibration
-            else:
-                break
-        if current is None:
-            raise CalibrationNotFoundError(
-                f"nenhuma calibração vigente para camera_id={camera_id!r} em {at.isoformat()}"
-            )
-        return current
-
-# --------------------------------------------------------------------------
-# Ponte I2 (+ calibração, quando existir) -> TrajectoryPoint. O
-# track_id de I2 é local à câmera — duas câmeras podem reportar
-# track_ids iguais para entidades físicas diferentes (ou o inverso: a
-# mesma entidade física vista por duas câmeras com track_ids
-# distintos).
-#
-# A posição em pixel vem sempre de I2. A posição em mundo só é
-# calculada quando há calibração de I3 vigente para a câmera/instante;
-# do contrário, `world_position` fica None — isso não é um erro: numa
-# instalação simples (zonas definidas em pixel, sem I3), o TrajectoryPoint
-# ainda é utilizável, só não pode ser testado contra zonas em "world".
-# --------------------------------------------------------------------------
-
-def to_trajectory_points(
-    event: TrackEvent, calibration_registry: CalibrationRegistry
-) -> List[TrajectoryPoint]:
+def _point(value, where: str) -> Point:
     try:
-        calibration = calibration_registry.resolve(event.camera_id, event.captured_at)
-    except CalibrationNotFoundError:
-        calibration = None
+        x, y = value
+        return Point(float(x), float(y))
+    except (TypeError, ValueError) as error:
+        raise ContractError(f"{where}: esperado [x, y], recebido {value!r}") from error
 
-    points = []
-    for track in event.tracks:
-        pixel_position = Point(track.u_px, track.v_px)
-        world_position = (
-            calibration.homography.project(track.u_px, track.v_px)
-            if calibration is not None
-            else None
-        )
-        points.append(
-            TrajectoryPoint(
-                timestamp=event.captured_at,
-                source_id=event.camera_id,
-                entity_id=f"{event.camera_id}:{track.track_id}",
-                world_position=world_position,
-                pixel_position=pixel_position,
+
+def _expect_schema(message: Dict, schema: str) -> Dict:
+    if message.get("schema") != schema:
+        raise ContractError(f"esperado schema {schema!r}, recebido {message.get('schema')!r}")
+    return _require(message, "payload", schema)
+
+
+def parse_tracks(message: Dict) -> Frame:
+    payload = _expect_schema(message, I2_TRACKS)
+    tracks = []
+    for index, raw in enumerate(_require(payload, "tracks", I2_TRACKS)):
+        where = f"{I2_TRACKS} tracks[{index}]"
+        state = _require(raw, "state", where)
+        if state not in _TRACK_STATES:
+            raise ContractError(f"{where}: state deve ser CONFIRMED ou LOST, recebido {state!r}")
+        tracks.append(
+            TrackObservation(
+                track_id=_require(raw, "track_id", where),
+                object_class=_require(raw, "class", where),
+                point_px=_point(_require(raw, "point_px", where), where),
+                lost=state == "LOST",
             )
         )
-    return points
+    return Frame(
+        source_id=_require(message, "source_id", I2_TRACKS),
+        session_id=_require(message, "session_id", I2_TRACKS),
+        frame_index=_require_int(payload, "frame_index", I2_TRACKS),
+        captured_at=parse_timestamp(_require(message, "captured_at", I2_TRACKS)),
+        tracks=tuple(tracks),
+        message_id=message.get("message_id"),
+    )
+
+
+def calibration_from_content(content: Dict, source_id: str, artifact_version: str) -> Calibration:
+    reference_frame = _require(content, "reference_frame", "CALIBRATION")
+    try:
+        homography = Homography(_require(content, "homography_px_to_m", "CALIBRATION"))
+    except ValueError as error:
+        raise ContractError(f"CALIBRATION: {error}") from error
+    return Calibration(
+        source_id=source_id,
+        artifact_version=artifact_version,
+        valid_from=parse_timestamp(_require(content, "valid_from", "CALIBRATION")),
+        homography=homography,
+        space_id=_require(reference_frame, "space_id", "CALIBRATION reference_frame"),
+    )
+
+
+def parse_calibration(message: Dict) -> Calibration:
+    payload = _expect_schema(message, I3_CALIBRATION)
+    return calibration_from_content(
+        payload,
+        source_id=_require(message, "source_id", I3_CALIBRATION),
+        artifact_version=_require(message, "artifact_version", I3_CALIBRATION),
+    )
+
+
+@dataclass(frozen=True)
+class SessionStart:
+    session_id: str
+    started_at: datetime
+    sources: Tuple[str, ...]
+
+
+def parse_session_started(message: Dict) -> SessionStart:
+    payload = _expect_schema(message, SESSION_STARTED)
+    return SessionStart(
+        session_id=_require(message, "session_id", SESSION_STARTED),
+        started_at=parse_timestamp(_require(payload, "started_at", SESSION_STARTED)),
+        sources=tuple(_require(payload, "sources", SESSION_STARTED)),
+    )
+
+
+@dataclass(frozen=True)
+class ArtifactDescriptor:
+    artifact_id: str
+    artifact_version: str
+    kind: str
+    owner: str
+    uri: str
+    hash_sha256: str
+    valid_from: datetime
+    schema_version: str
+
+
+def parse_artifact_descriptor(data: Dict) -> ArtifactDescriptor:
+    where = "descritor de artefato"
+    return ArtifactDescriptor(
+        artifact_id=_require(data, "artifact_id", where),
+        artifact_version=_require(data, "artifact_version", where),
+        kind=_require(data, "kind", where),
+        owner=_require(data, "owner", where),
+        uri=_require(data, "uri", where),
+        hash_sha256=_require(data, "hash_sha256", where),
+        valid_from=parse_timestamp(_require(data, "valid_from", where)),
+        schema_version=_require(data, "schema_version", where),
+    )
+
+
+def parse_artifact_published(message: Dict) -> ArtifactDescriptor:
+    return parse_artifact_descriptor(_expect_schema(message, ARTIFACT_PUBLISHED))
+
+def _parse_zone(raw: Dict, index: int) -> Zone:
+    zone_id = _require(raw, "zone_id", f"ZONES zones[{index}]")
+    where = f"ZONES zona {zone_id!r}"
+    return Zone(
+        zone_id=zone_id,
+        name=_require(raw, "name", where),
+        polygon=tuple(_point(vertex, where) for vertex in _require(raw, "polygon", where)),
+        enter_hysteresis_ms=_require_int(raw, "enter_hysteresis_ms", where),
+        exit_hysteresis_ms=_require_int(raw, "exit_hysteresis_ms", where),
+        max_occupancy=raw.get("max_occupancy"),
+        classes=tuple(raw.get("classes") or ()),
+    )
+
+
+def parse_zones(content: Dict, artifact_version: str) -> ZonesArtifact:
+    try:
+        source_ids = _require(content, "source_ids", "ZONES")
+        return ZonesArtifact(
+            artifact_version=artifact_version,
+            coordinates=_require(content, "coordinates", "ZONES"),
+            source_ids=tuple(source_ids),
+            zones=tuple(_parse_zone(raw, index) for index, raw in enumerate(_require(content, "zones", "ZONES"))),
+            space_id=content.get("space_id"),
+        )
+    except ContractError:
+        raise
+    except ValueError as error:
+        raise ContractError(f"ZONES: {error}") from error
 
 # --------------------------------------------------------------------------
-# Carregamento dos artefatos JSON de entrada.
+# Registro de artefatos. O registro real é de B5; aqui, uma pasta local em
+# que a URI registry://<caminho> aponta para <raiz>/<caminho>. O conteúdo
+# só é aceito se o sha256 bater com o do descritor.
 # --------------------------------------------------------------------------
 
-_COORDINATE_SYSTEM_BY_LABEL = {"mundo": "world", "pixel": "pixel"}
+class ArtifactRegistry:
+    def __init__(self, root: PathLike):
+        self._root = Path(root)
+
+    def load(self, descriptor: ArtifactDescriptor) -> Dict:
+        prefix = "registry://"
+        if not descriptor.uri.startswith(prefix):
+            raise ContractError(f"URI fora do registro: {descriptor.uri!r}")
+        data = (self._root / descriptor.uri[len(prefix):]).read_bytes()
+        if hashlib.sha256(data).hexdigest() != descriptor.hash_sha256:
+            raise ContractError(f"hash_sha256 não confere para {descriptor.artifact_version}")
+        return json.loads(data)
 
 
-def load_zones(path: PathLike) -> List[Zone]:
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    zones = []
-    for raw in data["zonas"]:
-        polygon = [Point(vertex["x"], vertex["y"]) for vertex in raw["poligono"]]
-        sistema_coordenadas = raw["sistema_coordenadas"]
-        if sistema_coordenadas not in _COORDINATE_SYSTEM_BY_LABEL:
-            raise ValueError(
-                f"zona {raw.get('zone_id')!r}: sistema_coordenadas deve ser "
-                f"'mundo' ou 'pixel', recebido {sistema_coordenadas!r}"
-            )
-        zones.append(
-            Zone(
-                zone_id=raw["zone_id"],
-                nome_amigavel=raw["nome_amigavel"],
-                polygon=polygon,
-                risco=raw["risco"],
-                cor_dashboard=raw["cor_dashboard"],
-                coordinate_system=_COORDINATE_SYSTEM_BY_LABEL[sistema_coordenadas],
-                camera_id=raw.get("camera_id"),
-                calibration_version=raw.get("versao_transformacao"),
-            )
-        )
-    return zones
+def load_json(path: PathLike):
+    return json.loads(Path(path).read_text(encoding="utf-8"))
 
-def load_track_events(path: PathLike) -> List[TrackEvent]:
-    """Carrega uma lista de eventos `ods.inferencia.rastreio` (I2)."""
 
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    events = [parse_track_event(raw) for raw in data]
-    events.sort(key=lambda event: event.captured_at)
-    return events
+def load_messages(path: PathLike) -> List[Dict]:
+    """Um arquivo com uma lista de mensagens, na ordem de chegada."""
 
-def load_calibration_events(path: PathLike) -> List[CalibrationEvent]:
-    """Carrega uma lista de eventos `ods.inferencia.calibracao` (I3)."""
-
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    return [parse_calibration_event(raw) for raw in data]
+    return list(load_json(path))

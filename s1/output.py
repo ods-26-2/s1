@@ -1,89 +1,167 @@
 """
-Saída do S1: mensagem `ods.visao.evento_espacial`.
+Saída do S1: as três mensagens da Especificação de interfaces 1.0, no
+envelope comum (perfil EV-SINAL).
 
-Mesmo envelope usado por I2/I3 (`message_type`, `schema`,
-`schema_version`, `producer`, `published_at`, `payload`). É publicada
-uma mensagem para cada leitura processada pelo `S1Service`
-(entity_id/source_id/timestamp/world_coordinates são sempre
-obrigatórios), enriquecida com:
+- `ods.s1.position`: uma por quadro e câmera, com a lista completa dos
+  rastros CONFIRMED (inclusive vazia).
+- `ods.s1.zone_transition`: uma por entrada ou saída confirmada;
+  `captured_at` é o instante do cruzamento.
+- `ods.s1.zone_occupancy`: uma por zona e câmera a cada mudança de contagem.
 
-- `zone_id`: presente apenas quando a entidade está, neste instante,
-  confirmada dentro de alguma zona.
-- `transition`: presente apenas quando esta leitura corresponde a uma
-  transição de zona confirmada pela histerese (entrada, saída ou troca
-  direta entre zonas).
-
-`world_coordinates` é obrigatório no contrato, mas nem toda leitura tem
-uma posição de mundo (instalação simples, zonas em pixel, sem
-calibração de I3 — ver `s1/ingestion.py`). Quando não há
-`world_position`, publicamos a posição em pixel nesse campo: é a
-melhor informação de localização disponível, e mantém o payload
-sempre válido em relação ao contrato.
+`artifact_version` é a versão do ZONES que produziu cada mensagem. `sequence` conta as
+mensagens do S1 por sessão, a partir de 0. `correlation_id` aponta para a
+mensagem que causou a publicação (o quadro de I2 ou o início de sessão).
+O payload nunca repete um campo do envelope.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Dict, Optional
+import uuid
+from datetime import datetime, timezone
+from typing import Callable, Dict, Iterable, List, Optional
 
-from .domain import TrajectoryPoint, ZoneEvent
+from .domain import FrameResult, Occupancy, Point, PositionItem, Transition
 
-SPATIAL_EVENT_SCHEMA = "ods.visao.evento_espacial"
-SPATIAL_EVENT_SCHEMA_VERSION = "1.0"
-SPATIAL_EVENT_PRODUCER = "S1"
-
-_TRANSITION_TYPE_BY_EVENT_TYPE = {
-    "enter": "entrada",
-    "exit": "saida",
-    "transfer": "transferencia",
-}
-
-def _format_timestamp(timestamp: datetime) -> str:
-    """ISO-8601 com milissegundos e sufixo 'Z' (ex: 2026-09-16T10:00:00.000Z)."""
-
-    millis = timestamp.microsecond // 1000
-    return timestamp.strftime("%Y-%m-%dT%H:%M:%S.") + f"{millis:03d}Z"
+POSITION = "ods.s1.position"
+ZONE_TRANSITION = "ods.s1.zone_transition"
+ZONE_OCCUPANCY = "ods.s1.zone_occupancy"
+SCHEMA_VERSION = "1.0"
+PRODUCER = "S1"
 
 
-def _build_transition(event: ZoneEvent) -> Optional[Dict]:
-    transition_type = _TRANSITION_TYPE_BY_EVENT_TYPE.get(event.event_type)
-    if transition_type is None:
-        return None
-    transition: Dict = {"type": transition_type}
-    if event.previous_zone_id is not None:
-        transition["previous_zone_id"] = event.previous_zone_id
-    return transition
+def format_timestamp(timestamp: datetime) -> str:
+    """ISO 8601 em UTC com milissegundos (2026-09-23T14:29:59.870Z)."""
+
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.astimezone(timezone.utc)
+    return timestamp.strftime("%Y-%m-%dT%H:%M:%S.") + f"{timestamp.microsecond // 1000:03d}Z"
 
 
-def to_spatial_event(
-    point: TrajectoryPoint, event: ZoneEvent, published_at: Optional[datetime] = None
-) -> Dict:
-    """Monta a mensagem `ods.visao.evento_espacial` para uma leitura
-    processada pelo S1Service.
+def _xy(point: Point) -> List[float]:
+    return [point.x, point.y]
 
-    `published_at` é o instante de publicação da mensagem; por padrão
-    usa o timestamp da própria leitura.
-    """
-    location = point.world_position or point.pixel_position
-    payload: Dict = {
-        "entity_id": point.entity_id,
-        "source_id": point.source_id,
-        "timestamp": _format_timestamp(point.timestamp),
-        "world_coordinates": {"x": location.x, "y": location.y},
-    }
 
-    if event.zone_id is not None:
-        payload["zone_id"] = event.zone_id
+class S1Publisher:
+    def __init__(
+        self,
+        clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        new_message_id: Callable[[], str] = lambda: str(uuid.uuid4()),
+    ):
+        self._clock = clock
+        self._new_message_id = new_message_id
+        self._sequence: Dict[str, int] = {}
 
-    transition = _build_transition(event)
-    if transition is not None:
-        payload["transition"] = transition
+    def frame_messages(self, result: FrameResult) -> List[Dict]:
+        """Posição do quadro, depois as transições, depois a ocupação."""
 
-    return {
-        "message_type": "event",
-        "schema": SPATIAL_EVENT_SCHEMA,
-        "schema_version": SPATIAL_EVENT_SCHEMA_VERSION,
-        "producer": SPATIAL_EVENT_PRODUCER,
-        "published_at": _format_timestamp(published_at or point.timestamp),
-        "payload": payload,
-    }
+        frame, artifact_version = result.frame, result.artifact_version
+        messages = [
+            self._envelope(
+                POSITION,
+                captured_at=frame.captured_at,
+                source_id=frame.source_id,
+                session_id=frame.session_id,
+                artifact_version=artifact_version,
+                correlation_id=frame.message_id,
+                payload={
+                    "frame_index": frame.frame_index,
+                    "positions": [self._position(item) for item in result.positions],
+                },
+            )
+        ]
+        messages += [
+            self._transition(transition, frame.session_id, artifact_version, frame.message_id)
+            for transition in result.transitions
+        ]
+        messages += self.occupancy_messages(result.occupancy_changes, frame.message_id)
+        return messages
+
+    def occupancy_messages(self, changes: Iterable[Occupancy], correlation_id: Optional[str] = None) -> List[Dict]:
+        return [
+            self._envelope(
+                ZONE_OCCUPANCY,
+                captured_at=change.at,
+                source_id=change.source_id,
+                session_id=change.session_id,
+                artifact_version=change.artifact_version,
+                correlation_id=correlation_id,
+                payload=self._occupancy(change),
+            )
+            for change in changes
+        ]
+
+    # ----------------------------------------------------------------------
+
+    @staticmethod
+    def _position(item: PositionItem) -> Dict:
+        payload = {"track_id": item.track_id, "class": item.object_class, "point_px": _xy(item.point_px)}
+        if item.position_m is not None:
+            payload["position_m"] = _xy(item.position_m)
+            payload["space_id"] = item.space_id
+        payload["zone_ids"] = list(item.zone_ids)
+        return payload
+
+    def _transition(
+        self, transition: Transition, session_id: str, artifact_version: str, correlation_id: Optional[str]
+    ) -> Dict:
+        payload = {
+            "track_id": transition.track_id,
+            "class": transition.object_class,
+            "zone_id": transition.zone_id,
+            "transition": transition.kind,
+            "entered_at": format_timestamp(transition.entered_at),
+        }
+        if transition.dwell_s is not None:
+            payload["dwell_s"] = transition.dwell_s
+        return self._envelope(
+            ZONE_TRANSITION,
+            captured_at=transition.at,
+            source_id=transition.source_id,
+            session_id=session_id,
+            artifact_version=artifact_version,
+            correlation_id=correlation_id,
+            payload=payload,
+        )
+
+    @staticmethod
+    def _occupancy(change: Occupancy) -> Dict:
+        payload = {"zone_id": change.zone_id, "count": change.count, "count_by_class": dict(change.count_by_class)}
+        if change.max_occupancy is not None:
+            payload["max_occupancy"] = change.max_occupancy
+        payload["track_ids"] = list(change.track_ids)
+        return payload
+
+    def _envelope(
+        self,
+        schema: str,
+        *,
+        captured_at: datetime,
+        source_id: str,
+        session_id: str,
+        artifact_version: str,
+        payload: Dict,
+        correlation_id: Optional[str] = None,
+    ) -> Dict:
+        sequence = self._sequence.get(session_id, 0)
+        self._sequence[session_id] = sequence + 1
+        message = {
+            "message_type": "event",
+            "message_id": self._new_message_id(),
+            "schema": schema,
+            "schema_version": SCHEMA_VERSION,
+            "producer": PRODUCER,
+        }
+        if correlation_id is not None:
+            message["correlation_id"] = correlation_id
+        message.update(
+            {
+                "published_at": format_timestamp(self._clock()),
+                "captured_at": format_timestamp(captured_at),
+                "source_id": source_id,
+                "session_id": session_id,
+                "sequence": sequence,
+                "artifact_version": artifact_version,
+                "payload": payload,
+            }
+        )
+        return message

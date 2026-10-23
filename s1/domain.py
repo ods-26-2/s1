@@ -1,10 +1,10 @@
 """
 Núcleo do componente S1 - Zonas, ocupação e eventos (Camada 3).
 
-Reúne os modelos de dados, o motor de geometria (associação
-ponto -> zona), o controlador de histerese (entrada/saída/permanência)
-e o serviço que orquestra os três. 
-Isso independe de onde os dados entram (`s1/ingestion.py`) ou de como a saída é publicada (`s1/output.py`).
+Modelos, geometria (zonas e homografia), histerese de entrada/saída e o
+serviço que processa os rastros de I2 quadro a quadro, por câmera. Não
+sabe de onde as mensagens vêm (`s1/ingestion.py`) nem como são
+publicadas (`s1/output.py`).
 """
 
 from __future__ import annotations
@@ -16,9 +16,10 @@ from typing import Dict, List, Optional, Set, Tuple
 from shapely.geometry import Point as ShapelyPoint
 from shapely.geometry import Polygon as ShapelyPolygon
 
-# --------------------------------------------------------------------------
-# Modelos
-# --------------------------------------------------------------------------
+METERS = "METERS"
+PIXELS = "PIXELS"
+ENTER = "ENTER"
+EXIT = "EXIT"
 
 @dataclass(frozen=True)
 class Point:
@@ -27,278 +28,395 @@ class Point:
 
 @dataclass(frozen=True)
 class Zone:
-    """Artefato de zona nomeada.
-
-    `coordinate_system` declara explicitamente em que sistema o
-    `polygon` está expresso — "pixel" (instalação simples, uma câmera,
-    sem necessidade de I3) ou "world" (coordenadas de mundo, quando há
-    métrica ou mais de uma câmera). Uma zona em pixel só faz sentido
-    para uma câmera específica (`camera_id`); uma zona em mundo não
-    depende de nenhuma câmera em particular. `calibration_version`
-    referencia a versão da transformação de I3 vigente quando a zona
-    foi definida (obrigatória para zonas em pixel, já que a geometria
-    só é válida para aquela homografia específica).
-    """
-
     zone_id: str
-    nome_amigavel: str
-    polygon: List[Point]
-    risco: str
-    cor_dashboard: str
-    coordinate_system: str  # "pixel" | "world"
-    camera_id: Optional[str] = None
-    calibration_version: Optional[str] = None
+    name: str
+    polygon: Tuple[Point, ...]
+    enter_hysteresis_ms: int
+    exit_hysteresis_ms: int
+    max_occupancy: Optional[int] = None
+    classes: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.coordinate_system not in ("pixel", "world"):
-            raise ValueError(
-                f"coordinate_system deve ser 'pixel' ou 'world', recebido {self.coordinate_system!r}"
-            )
-        if self.coordinate_system == "pixel" and not self.camera_id:
-            raise ValueError(
-                f"zona {self.zone_id!r}: coordinate_system='pixel' exige camera_id"
-            )
+        if len(self.polygon) < 3:
+            raise ValueError(f"zona {self.zone_id!r}: polygon precisa de pelo menos 3 pontos")
+        if self.enter_hysteresis_ms < 0 or self.exit_hysteresis_ms < 0:
+            raise ValueError(f"zona {self.zone_id!r}: histerese não pode ser negativa")
+        if self.max_occupancy is not None and self.max_occupancy < 1:
+            raise ValueError(f"zona {self.zone_id!r}: max_occupancy deve ser >= 1")
+
+    def accepts(self, object_class: str) -> bool:
+        return not self.classes or object_class in self.classes
 
 @dataclass(frozen=True)
-class TrajectoryPoint:
-    """Uma leitura de trajetória, na(s) representação(ões) disponível(is).
+class ZonesArtifact:
+    artifact_version: str
+    coordinates: str
+    source_ids: Tuple[str, ...]
+    zones: Tuple[Zone, ...]
+    space_id: Optional[str] = None
 
-    `pixel_position` vem sempre de I2. `world_position` só existe
-    quando havia calibração de I3 vigente para projetar o pixel —
-    numa instalação simples (zonas em pixel, sem I3), fica `None`, e
-    isso é esperado, não um erro.
-    """
+    def __post_init__(self) -> None:
+        if self.coordinates not in (METERS, PIXELS):
+            raise ValueError(f"coordinates deve ser METERS ou PIXELS, recebido {self.coordinates!r}")
+        if self.coordinates == METERS and not self.space_id:
+            raise ValueError("coordinates=METERS exige space_id")
+        if not self.source_ids:
+            raise ValueError("source_ids não pode ser vazio")
+        if self.coordinates == PIXELS and len(self.source_ids) != 1:
+            raise ValueError("coordinates=PIXELS exige exatamente um source_id")
+        zone_ids = [zone.zone_id for zone in self.zones]
+        if len(set(zone_ids)) != len(zone_ids):
+            raise ValueError("zone_id repetido no artefato ZONES")
 
-    timestamp: datetime
+class DegenerateHomographyError(ValueError):
+    """A homografia projeta o ponto para o infinito (w = 0)."""
+class Homography:
+    def __init__(self, matrix: List[List[float]]):
+        if len(matrix) != 3 or any(len(row) != 3 for row in matrix):
+            raise ValueError("homografia deve ser uma matriz 3x3")
+        self._matrix = matrix
+
+    def project(self, point: Point) -> Point:
+        h = self._matrix
+        x = h[0][0] * point.x + h[0][1] * point.y + h[0][2]
+        y = h[1][0] * point.x + h[1][1] * point.y + h[1][2]
+        w = h[2][0] * point.x + h[2][1] * point.y + h[2][2]
+        if w == 0:
+            raise DegenerateHomographyError(f"homografia degenerada para o pixel {point}")
+        return Point(round(x / w, 3), round(y / w, 3))
+
+@dataclass(frozen=True)
+class Calibration:
     source_id: str
-    entity_id: str
-    world_position: Optional[Point] = None
-    pixel_position: Optional[Point] = None
+    artifact_version: str
+    valid_from: datetime
+    homography: Homography
+    space_id: str
 
-@dataclass
-class ZoneEvent:
-    entity_id: str
-    timestamp: datetime
-    zone_id: Optional[str]
-    zone_name: Optional[str]
-    event_type: str  # "enter" | "exit" | "transfer" | "update" | "none"
-    entered_at: Optional[datetime] = None
-    dwell_seconds: Optional[float] = None
-    occupancy: int = 0
-    risco: Optional[str] = None
-    cor_dashboard: Optional[str] = None
-    previous_zone_id: Optional[str] = None
+class CalibrationRegistry:
+    def __init__(self) -> None:
+        self._by_source: Dict[str, List[Calibration]] = {}
 
-# --------------------------------------------------------------------------
-# Motor de Geometria Estática: resolve se um ponto está dentro de um
-# polígono (zona), desempatando sobreposições pela zona de centróide
-# mais próximo. Cada zona é resolvida no seu próprio sistema de
-# coordenadas: zonas "world" usam a posição já projetada para mundo;
-# zonas "pixel" usam a posição em pixel bruta e só são candidatas para
-# leituras da mesma câmera (`camera_id`) em que foram definidas.
-# --------------------------------------------------------------------------
+    def register(self, calibration: Calibration) -> None:
+        entries = self._by_source.setdefault(calibration.source_id, [])
+        if any(entry.artifact_version == calibration.artifact_version for entry in entries):
+            return
+        entries.append(calibration)
+        entries.sort(key=lambda entry: entry.valid_from)
+
+    def resolve(self, source_id: str, at: datetime) -> Optional[Calibration]:
+        current = None
+        for calibration in self._by_source.get(source_id, []):
+            if calibration.valid_from > at:
+                break
+            current = calibration
+        return current
+
+@dataclass(frozen=True)
+class TrackObservation:
+    track_id: str
+    object_class: str
+    point_px: Point
+    lost: bool = False
+
+@dataclass(frozen=True)
+class Frame:
+    source_id: str
+    session_id: str
+    frame_index: int
+    captured_at: datetime
+    tracks: Tuple[TrackObservation, ...]
+    message_id: Optional[str] = None
+
+@dataclass(frozen=True)
+class PositionItem:
+    track_id: str
+    object_class: str
+    point_px: Point
+    position_m: Optional[Point]
+    space_id: Optional[str]
+    zone_ids: Tuple[str, ...]
+
+@dataclass(frozen=True)
+class Transition:
+    source_id: str
+    track_id: str
+    object_class: str
+    zone_id: str
+    kind: str  # ENTER | EXIT
+    at: datetime
+    entered_at: datetime
+    dwell_s: Optional[int] = None
+
+@dataclass(frozen=True)
+class Occupancy:
+    source_id: str
+    session_id: str
+    artifact_version: str  # versão do ZONES a que a zona pertence
+    zone_id: str
+    count: int
+    count_by_class: Dict[str, int]
+    track_ids: Tuple[str, ...]
+    at: datetime
+    max_occupancy: Optional[int] = None
+
+@dataclass(frozen=True)
+class FrameResult:
+    frame: Frame
+    artifact_version: str  # versão do ZONES usada no quadro
+    positions: Tuple[PositionItem, ...]
+    transitions: Tuple[Transition, ...]
+    occupancy_changes: Tuple[Occupancy, ...]
 
 class ZoneResolver:
-    def __init__(self, zones: List[Zone]):
-        self._zones = list(zones)
-        self._polygons: Dict[str, ShapelyPolygon] = {
-            zone.zone_id: ShapelyPolygon([(p.x, p.y) for p in zone.polygon])
-            for zone in self._zones
+    def __init__(self, artifact: ZonesArtifact):
+        self.artifact = artifact
+        self._polygons = {
+            zone.zone_id: ShapelyPolygon([(p.x, p.y) for p in zone.polygon]) for zone in artifact.zones
         }
 
-    def zones(self) -> List[Zone]:
-        return list(self._zones)
-
-    def zone_by_id(self, zone_id: str) -> Optional[Zone]:
-        for zone in self._zones:
-            if zone.zone_id == zone_id:
-                return zone
-        return None
-
-    def resolve(
+    def zones_containing(
         self,
         source_id: str,
-        world_position: Optional[Point],
-        pixel_position: Optional[Point],
-    ) -> Optional[Zone]:
-        """Retorna a zona que contém o ponto, ou None se estiver fora
-        de todas as zonas conhecidas (ou se a representação necessária
-        para testar uma zona não estiver disponível)."""
+        point_px: Point,
+        position_m: Optional[Point],
+        space_id: Optional[str],
+    ) -> List[Zone]:
+        artifact = self.artifact
+        if source_id not in artifact.source_ids:
+            return []
+        if artifact.coordinates == METERS:
+            if position_m is None or space_id != artifact.space_id:
+                return []
+            test_point = position_m
+        else:
+            test_point = point_px
+        shapely_point = ShapelyPoint(test_point.x, test_point.y)
+        return [zone for zone in artifact.zones if self._polygons[zone.zone_id].contains(shapely_point)]
 
-        candidates = []
-        for zone in self._zones:
-            if zone.coordinate_system == "world":
-                if world_position is None:
-                    continue
-                test_point = world_position
-            else:  # "pixel"
-                if pixel_position is None or zone.camera_id != source_id:
-                    continue
-                test_point = pixel_position
-
-            shapely_point = ShapelyPoint(test_point.x, test_point.y)
-            if self._polygons[zone.zone_id].contains(shapely_point):
-                candidates.append((zone, shapely_point))
-
-        if not candidates:
-            return None
-        if len(candidates) == 1:
-            return candidates[0][0]
-
-        # Sobreposição: desempata pela zona de centróide mais próximo
-        # (distância calculada no sistema de coordenadas da própria
-        # zona — comparar diretamente pixel com metros não faz sentido,
-        # mas esse caso de zonas de sistemas diferentes sobrepostas é
-        # uma configuração incomum e fora do escopo desta resolução).
-        return min(
-            candidates,
-            key=lambda pair: self._polygons[pair[0].zone_id].centroid.distance(pair[1]),
-        )[0]
-
-# --------------------------------------------------------------------------
-# Controlador de Estado Espacial: aplica uma janela de histerese à
-# transição de zona de cada entidade, evitando que oscilações na borda
-# de uma zona (ex: uma entidade "balançando" na porta) gerem múltiplos
-# eventos de entrada/saída. Uma transição só é confirmada depois que a
-# nova leitura bruta se repete por N amostras consecutivas — e N é
-# diferente para entrar (`enter_streak`) e para sair (`exit_streak`):
-# reagir rápido a uma entrada é geralmente desejável, mas confirmar
-# saída rápido demais faz a entidade "sumir" por uma oclusão breve ou
-# um pé cruzando a linha da zona, por isso o padrão exige mais amostras
-# para confirmar saída do que para confirmar entrada.
-# --------------------------------------------------------------------------
+MembershipKey = Tuple[str, str, str]  # (source_id, track_id, zone_id)
 
 @dataclass
-class _EntityState:
-    confirmed_zone_id: Optional[str] = None
-    pending_zone_id: Optional[str] = None
-    pending_streak: int = 0
+class _Membership:
+    inside: bool = False
+    pending_since: Optional[datetime] = None
 
 class HysteresisController:
-    def __init__(self, enter_streak: int = 2, exit_streak: int = 3):
-        if enter_streak < 1:
-            raise ValueError("enter_streak deve ser >= 1")
-        if exit_streak < 1:
-            raise ValueError("exit_streak deve ser >= 1")
-        self._enter_streak = enter_streak
-        self._exit_streak = exit_streak
-        self._states: Dict[str, _EntityState] = {}
+    def __init__(self) -> None:
+        self._states: Dict[MembershipKey, _Membership] = {}
 
     def update(
-        self, entity_id: str, raw_zone_id: Optional[str]
-    ) -> Tuple[Optional[str], bool]:
-        """Processa a leitura bruta de zona para a entidade.
+        self,
+        key: MembershipKey,
+        raw_inside: bool,
+        at: datetime,
+        enter_hysteresis_ms: int,
+        exit_hysteresis_ms: int,
+    ) -> Tuple[bool, Optional[datetime]]:
 
-        Retorna uma tupla (zona_confirmada, houve_transicao).
-        """
+        state = self._states.get(key)
+        if state is None:
+            if not raw_inside:
+                return False, None
+            state = self._states[key] = _Membership()
 
-        state = self._states.setdefault(entity_id, _EntityState())
+        if raw_inside == state.inside:
+            state.pending_since = None
+            if not state.inside:
+                del self._states[key]
+            return state.inside, None
 
-        if raw_zone_id == state.confirmed_zone_id:
-            # Confirma a permanência: descarta qualquer transição pendente.
-            state.pending_zone_id = None
-            state.pending_streak = 0
-            return state.confirmed_zone_id, False
+        if state.pending_since is None:
+            state.pending_since = at
+        required_ms = enter_hysteresis_ms if raw_inside else exit_hysteresis_ms
+        if (at - state.pending_since).total_seconds() * 1000 < required_ms:
+            return state.inside, None
 
-        if raw_zone_id == state.pending_zone_id:
-            state.pending_streak += 1
-        else:
-            state.pending_zone_id = raw_zone_id
-            state.pending_streak = 1
+        started_at = state.pending_since
+        state.inside = raw_inside
+        state.pending_since = None
+        if not state.inside:
+            del self._states[key]
+        return raw_inside, started_at
 
-        # raw_zone_id is None => a leitura indica "fora de qualquer
-        # zona" (critério de saída); caso contrário, é uma candidata a
-        # entrada (numa zona nova ou numa troca direta entre zonas).
-        required_streak = self._exit_streak if raw_zone_id is None else self._enter_streak
+    def close_track(self, source_id: str, track_id: str) -> List[Tuple[str, Optional[datetime]]]:
 
-        if state.pending_streak >= required_streak:
-            state.confirmed_zone_id = raw_zone_id
-            state.pending_zone_id = None
-            state.pending_streak = 0
-            return state.confirmed_zone_id, True
+        closed = []
+        for key in [key for key in self._states if key[0] == source_id and key[1] == track_id]:
+            state = self._states.pop(key)
+            if state.inside:
+                closed.append((key[2], state.pending_since))
+        return closed
 
-        return state.confirmed_zone_id, False
-
-    def current_zone(self, entity_id: str) -> Optional[str]:
-        state = self._states.get(entity_id)
-        return state.confirmed_zone_id if state else None
-
-    def reset(self, entity_id: str) -> None:
-        self._states.pop(entity_id, None)
-
-# --------------------------------------------------------------------------
-# S1Service: orquestra geometria + histerese + ocupação. Recebe
-# trajetórias contínuas (ver s1/ingestion.py para a conversão a partir
-# de I2/I3, que produz tanto a posição em pixel quanto — quando há
-# calibração de I3 — a posição projetada em mundo) e emite eventos
-# espacialmente qualificados: associação (carimbo) entre a entidade e a
-# região, com a transição de bordas protegida pela histerese.
-# --------------------------------------------------------------------------
+    def reset_source(self, source_id: str) -> None:
+        for key in [key for key in self._states if key[0] == source_id]:
+            del self._states[key]
 
 class S1Service:
-    def __init__(self, resolver: ZoneResolver, enter_streak: int = 2, exit_streak: int = 3):
-        self._resolver = resolver
-        self._hysteresis = HysteresisController(enter_streak=enter_streak, exit_streak=exit_streak)
-        self._occupancy: Dict[str, Set[str]] = {
-            zone.zone_id: set() for zone in resolver.zones()
+    def __init__(self, zones: ZonesArtifact, calibrations: Optional[CalibrationRegistry] = None):
+        self._resolver = ZoneResolver(zones)
+        self._pending_zones: Optional[ZonesArtifact] = None
+        self._calibrations = calibrations or CalibrationRegistry()
+        self._hysteresis = HysteresisController()
+        self._sessions: Dict[str, str] = {}
+        self._ended_sessions: Set[str] = set()
+        self._last_frame_index: Dict[str, int] = {}
+        self._members: Dict[Tuple[str, str], Dict[str, str]] = {}  # (source, zone) -> {track: classe}
+        self._entered_at: Dict[MembershipKey, datetime] = {}
+        self._last_seen: Dict[Tuple[str, str], datetime] = {}
+
+    @property
+    def zones(self) -> ZonesArtifact:
+        return self._resolver.artifact
+
+    def add_calibration(self, calibration: Calibration) -> None:
+        self._calibrations.register(calibration)
+
+    def schedule_zones(self, zones: ZonesArtifact) -> None:
+        self._pending_zones = zones
+
+    def start_session(self, session_id: str, sources: List[str], started_at: datetime) -> List[Occupancy]:
+        """Reinicia o estado das câmeras que mudaram de sessão. Devolve a
+        ocupação zerada das zonas que tinham alguém (sem publicar saídas)."""
+
+        changed = [source for source in sources if self._sessions.get(source) != session_id]
+        if not changed:
+            return []
+        is_change = any(self._sessions.get(source) is not None for source in changed)
+        apply_zones = self._pending_zones is not None and (is_change or not self._sessions)
+        to_reset = list(dict.fromkeys(changed + (list(self._sessions) if apply_zones else [])))
+        for source in changed:
+            previous = self._sessions.get(source)
+            if previous is not None:
+                self._ended_sessions.add(previous)
+            self._sessions[source] = session_id
+            self._last_frame_index.pop(source, None)
+        reset: List[Occupancy] = []
+        for source in to_reset:
+            reset.extend(self._reset_source(source, started_at))
+        if apply_zones:
+            self._resolver = ZoneResolver(self._pending_zones)
+            self._pending_zones = None
+        return reset
+
+    def process_frame(self, frame: Frame) -> Optional[FrameResult]:
+
+        source = frame.source_id
+        if frame.session_id in self._ended_sessions:
+            return None
+        reset = []
+        if self._sessions.get(source) != frame.session_id:
+            reset = self.start_session(frame.session_id, [source], frame.captured_at)
+        last_index = self._last_frame_index.get(source)
+        if last_index is not None and frame.frame_index <= last_index:
+            return None
+        self._last_frame_index[source] = frame.frame_index
+
+        positions: List[PositionItem] = []
+        exits: List[Transition] = []
+        enters: List[Transition] = []
+        for track in frame.tracks:
+            if track.lost:
+                exits.extend(self._close_track(source, track, frame.captured_at))
+                continue
+            positions.append(self._observe(frame, track, exits, enters))
+
+        transitions = exits + enters
+        occupancy_changes = {(occupancy.source_id, occupancy.zone_id): occupancy for occupancy in reset}
+        for zone_id in dict.fromkeys(transition.zone_id for transition in transitions):
+            occupancy_changes[(source, zone_id)] = self._occupancy(source, zone_id, frame.captured_at)
+        return FrameResult(
+            frame=frame,
+            artifact_version=self.zones.artifact_version,
+            positions=tuple(positions),
+            transitions=tuple(transitions),
+            occupancy_changes=tuple(occupancy_changes.values()),
+        )
+
+    def occupancy_snapshot(self, source_id: str) -> Dict[str, int]:
+        return {
+            zone.zone_id: len(self._members.get((source_id, zone.zone_id), {})) for zone in self.zones.zones
         }
-        self._entered_at: Dict[Tuple[str, str], datetime] = {}
 
-    def process(self, point: TrajectoryPoint) -> ZoneEvent:
-        raw_zone = self._resolver.resolve(
-            point.source_id, point.world_position, point.pixel_position
-        )
-        raw_zone_id = raw_zone.zone_id if raw_zone else None
+    def _observe(
+        self, frame: Frame, track: TrackObservation, exits: List[Transition], enters: List[Transition]
+    ) -> PositionItem:
+        source, at = frame.source_id, frame.captured_at
+        self._last_seen[(source, track.track_id)] = at
 
-        previous_zone_id = self._hysteresis.current_zone(point.entity_id)
-        confirmed_zone_id, transitioned = self._hysteresis.update(
-            point.entity_id, raw_zone_id
-        )
+        position_m, space_id = None, None
+        calibration = self._calibrations.resolve(source, at)
+        if calibration is not None:
+            position_m, space_id = calibration.homography.project(track.point_px), calibration.space_id
 
-        event_type = "none"
-        if transitioned:
-            if previous_zone_id is not None:
-                self._occupancy[previous_zone_id].discard(point.entity_id)
-                self._entered_at.pop((point.entity_id, previous_zone_id), None)
-                event_type = "exit" if confirmed_zone_id is None else "transfer"
-            if confirmed_zone_id is not None:
-                self._occupancy[confirmed_zone_id].add(point.entity_id)
-                self._entered_at[(point.entity_id, confirmed_zone_id)] = point.timestamp
-                if previous_zone_id is None:
-                    event_type = "enter"
-        elif confirmed_zone_id is not None:
-            event_type = "update"
+        candidates = self._resolver.zones_containing(source, track.point_px, position_m, space_id)
+        candidate_ids = {zone.zone_id for zone in candidates}
+        for zone in self.zones.zones:
+            key = (source, track.track_id, zone.zone_id)
+            raw_inside = zone.zone_id in candidate_ids and zone.accepts(track.object_class)
+            inside, started_at = self._hysteresis.update(
+                key, raw_inside, at, zone.enter_hysteresis_ms, zone.exit_hysteresis_ms
+            )
+            if started_at is None:
+                continue
+            if inside:
+                self._members.setdefault((source, zone.zone_id), {})[track.track_id] = track.object_class
+                self._entered_at[key] = started_at
+                enters.append(Transition(source, track.track_id, track.object_class, zone.zone_id, ENTER, started_at, started_at))
+            else:
+                exits.append(self._exit(source, track.track_id, track.object_class, zone.zone_id, started_at))
 
-        zone = self._resolver.zone_by_id(confirmed_zone_id) if confirmed_zone_id else None
-        entered_at = (
-            self._entered_at.get((point.entity_id, confirmed_zone_id))
-            if confirmed_zone_id
-            else None
-        )
-        dwell_seconds = (
-            (point.timestamp - entered_at).total_seconds()
-            if entered_at is not None
-            else None
-        )
-        occupancy = (
-            len(self._occupancy[confirmed_zone_id]) if confirmed_zone_id else 0
+        return PositionItem(
+            track_id=track.track_id,
+            object_class=track.object_class,
+            point_px=track.point_px,
+            position_m=position_m,
+            space_id=space_id,
+            zone_ids=tuple(zone.zone_id for zone in candidates),
         )
 
-        return ZoneEvent(
-            entity_id=point.entity_id,
-            timestamp=point.timestamp,
-            zone_id=confirmed_zone_id,
-            zone_name=zone.nome_amigavel if zone else None,
-            event_type=event_type,
-            entered_at=entered_at,
-            dwell_seconds=dwell_seconds,
-            occupancy=occupancy,
-            risco=zone.risco if zone else None,
-            cor_dashboard=zone.cor_dashboard if zone else None,
-            previous_zone_id=previous_zone_id,
+    def _close_track(self, source: str, track: TrackObservation, at: datetime) -> List[Transition]:
+        """Rastro LOST: sai de toda zona em que estava. A saída aconteceu no
+        início da saída pendente, se havia uma; senão, na última vez em que
+        o rastro foi visto."""
+
+        last_seen = self._last_seen.pop((source, track.track_id), at)
+        return [
+            self._exit(source, track.track_id, track.object_class, zone_id, pending_exit or last_seen)
+            for zone_id, pending_exit in self._hysteresis.close_track(source, track.track_id)
+        ]
+
+    def _exit(self, source: str, track_id: str, object_class: str, zone_id: str, at: datetime) -> Transition:
+        self._members.get((source, zone_id), {}).pop(track_id, None)
+        entered_at = self._entered_at.pop((source, track_id, zone_id))
+        dwell_s = int(round((at - entered_at).total_seconds()))
+        return Transition(source, track_id, object_class, zone_id, EXIT, at, entered_at, dwell_s)
+
+    def _occupancy(self, source: str, zone_id: str, at: datetime) -> Occupancy:
+        zone = next(zone for zone in self.zones.zones if zone.zone_id == zone_id)
+        members = self._members.get((source, zone_id), {})
+        count_by_class = {object_class: 0 for object_class in zone.classes}
+        for object_class in members.values():
+            count_by_class[object_class] = count_by_class.get(object_class, 0) + 1
+        return Occupancy(
+            source_id=source,
+            session_id=self._sessions[source],
+            artifact_version=self.zones.artifact_version,
+            zone_id=zone_id,
+            count=len(members),
+            count_by_class=count_by_class,
+            track_ids=tuple(sorted(members)),
+            at=at,
+            max_occupancy=zone.max_occupancy,
         )
 
-    def occupancy_snapshot(self) -> Dict[str, int]:
-        """Contagem instantânea de entidades confirmadas por zona."""
-
-        return {zone_id: len(entities) for zone_id, entities in self._occupancy.items()}
+    def _reset_source(self, source: str, at: datetime) -> List[Occupancy]:
+        occupied = [zone_id for (s, zone_id), members in self._members.items() if s == source and members]
+        self._hysteresis.reset_source(source)
+        for key in [key for key in self._members if key[0] == source]:
+            del self._members[key]
+        for key in [key for key in self._entered_at if key[0] == source]:
+            del self._entered_at[key]
+        for key in [key for key in self._last_seen if key[0] == source]:
+            del self._last_seen[key]
+        return [self._occupancy(source, zone_id, at) for zone_id in occupied]

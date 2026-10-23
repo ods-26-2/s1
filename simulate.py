@@ -1,12 +1,13 @@
 """Simulador do componente S1 - Zonas, ocupação e eventos.
 
-Consome eventos de rastreio de I2 (`ods.inferencia.rastreio`, coordenadas
-em pixel) e de calibração de I3 (`ods.inferencia.calibracao`, homografia
-por câmera), projeta cada track para coordenadas de mundo e imprime, na
-ordem temporal, os eventos espacialmente qualificados emitidos pelo S1.
+Faz o papel do barramento: entrega ao S1, na ordem de chegada, as
+mensagens de um arquivo (ods.session.started e ods.i2.tracks no cenário
+padrão) e mostra o que o S1 publica — ods.s1.position, ods.s1.zone_transition
+e ods.s1.zone_occupancy, no envelope comum da Especificação 1.0.
 
-Também grava, ao final, um arquivo JSON com as mensagens publicadas pelo
-S1 (`ods.visao.evento_espacial`) — uma por leitura processada.
+Cenário padrão (A3, modo pixel): um objeto oscilando na borda do Portão
+Sul, que a histerese nunca confirma, e o "Objeto 99", que entra na
+Recepção, fica ocluído e sai quando I2 encerra o rastro (LOST).
 """
 
 from __future__ import annotations
@@ -15,102 +16,67 @@ import argparse
 import json
 from pathlib import Path
 
-from s1.domain import S1Service, ZoneResolver
-from s1.ingestion import (
-    CalibrationRegistry,
-    load_calibration_events,
-    load_track_events,
-    load_zones,
-    to_trajectory_points,
-)
-from s1.output import to_spatial_event
+from s1.domain import S1Service
+from s1.ingestion import load_json, load_messages, parse_zones
+from s1.output import POSITION, ZONE_OCCUPANCY, ZONE_TRANSITION, S1Publisher
+from s1.runtime import S1Runtime
 
 DATA_DIR = Path(__file__).parent / "data"
 
 
+def _describe(message: dict) -> str:
+    payload = message["payload"]
+    head = f"[{message['captured_at']}] {message['source_id']} #{message['sequence']:<3}"
+    if message["schema"] == POSITION:
+        items = ", ".join(
+            f"{item['track_id']} {item['point_px']} zonas={item['zone_ids']}" for item in payload["positions"]
+        )
+        return f"{head} position   quadro {payload['frame_index']}: {items or 'nenhum rastro'}"
+    if message["schema"] == ZONE_TRANSITION:
+        dwell = f", dwell_s={payload['dwell_s']}" if "dwell_s" in payload else ""
+        return f"{head} transition {payload['transition']} {payload['track_id']} em {payload['zone_id']}{dwell}"
+    if message["schema"] == ZONE_OCCUPANCY:
+        return (
+            f"{head} occupancy  {payload['zone_id']}: count={payload['count']} "
+            f"{payload['count_by_class']} track_ids={payload['track_ids']}"
+        )
+    return head
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--zonas",
-        default=str(DATA_DIR / "definicao_zonas.json"),
-        help="Caminho do artefato JSON de definição de zonas.",
-    )
-    parser.add_argument(
-        "--eventos-i2",
-        default=str(DATA_DIR / "i2_eventos.json"),
-        help="Caminho do JSON com eventos de rastreio de I2 (ods.inferencia.rastreio).",
-    )
-    parser.add_argument(
-        "--calibracoes-i3",
-        default=str(DATA_DIR / "i3_calibracoes.json"),
-        help="Caminho do JSON com eventos de calibração de I3 (ods.inferencia.calibracao).",
-    )
-    parser.add_argument(
-        "--streak-entrada",
-        type=int,
-        default=2,
-        help="Nº de leituras consecutivas para confirmar uma entrada em zona (histerese).",
-    )
-    parser.add_argument(
-        "--streak-saida",
-        type=int,
-        default=3,
-        help="Nº de leituras consecutivas para confirmar uma saída de zona (histerese).",
-    )
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--zonas", default=str(DATA_DIR / "zones_a3.json"), help="Conteúdo do artefato ZONES.")
+    parser.add_argument("--versao-zonas", default="zones-a3-1", help="artifact_version do ZONES carregado.")
+    parser.add_argument("--entrada", default=str(DATA_DIR / "entrada_demo.json"), help="Mensagens de entrada, na ordem de chegada.")
+    parser.add_argument("--calibracao", help="Mensagens ods.i3.calibration a entregar antes da entrada (opcional).")
     parser.add_argument(
         "--saida",
         default=str(DATA_DIR / "output" / "eventos_s1.json"),
-        help="Caminho do JSON com as mensagens publicadas pelo S1 (use '-' para não gravar arquivo).",
+        help="Arquivo com as mensagens publicadas pelo S1 ('-' para não gravar).",
     )
     args = parser.parse_args()
 
-    zones = load_zones(args.zonas)
+    zones = parse_zones(load_json(args.zonas), args.versao_zonas)
+    runtime = S1Runtime(S1Service(zones), S1Publisher(), zones_artifact_id=args.versao_zonas.rsplit("-", 1)[0])
 
-    calibration_registry = CalibrationRegistry()
-    calibration_registry.register_many(load_calibration_events(args.calibracoes_i3))
-
-    trajectory = []
-    for track_event in load_track_events(args.eventos_i2):
-        trajectory.extend(to_trajectory_points(track_event, calibration_registry))
-    trajectory.sort(key=lambda point: point.timestamp)
-
-    service = S1Service(
-        ZoneResolver(zones),
-        enter_streak=args.streak_entrada,
-        exit_streak=args.streak_saida,
-    )
-
-    print(f"Carregadas {len(zones)} zona(s) e {len(trajectory)} leitura(s) de trajetória.")
+    incoming = (load_messages(args.calibracao) if args.calibracao else []) + load_messages(args.entrada)
     print(
-        f"Histerese: {args.streak_entrada} leitura(s) para confirmar entrada, "
-        f"{args.streak_saida} para confirmar saída.\n"
+        f"ZONES {zones.artifact_version} em {zones.coordinates} para {list(zones.source_ids)}: "
+        f"{len(zones.zones)} zona(s); {len(incoming)} mensagem(ns) de entrada.\n"
     )
 
-    spatial_events = []
-    for point in trajectory:
-        event = service.process(point)
-        zone_label = event.zone_name or "fora de qualquer zona"
-        location = point.world_position or point.pixel_position
-        print(
-            f"[{point.timestamp.isoformat()}] {point.entity_id} "
-            f"@ ({location.x:.2f}, {location.y:.2f}) -> {zone_label} "
-            f"| evento={event.event_type} | ocupação={event.occupancy}"
-        )
-        spatial_events.append(to_spatial_event(point, event))
+    published = []
+    for message in incoming:
+        for output in runtime.handle(message):
+            published.append(output)
+            print(_describe(output))
 
-    print("\nOcupação final por zona:")
-    for zone in zones:
-        count = service.occupancy_snapshot()[zone.zone_id]
-        print(f"  {zone.nome_amigavel} ({zone.zone_id}, {zone.risco}): {count} entidade(s)")
-
-    print(f"\n{len(spatial_events)} mensagem(ns) 'ods.visao.evento_espacial' publicada(s).")
+    counts = {schema: sum(m["schema"] == schema for m in published) for schema in (POSITION, ZONE_TRANSITION, ZONE_OCCUPANCY)}
+    print("\n" + ", ".join(f"{count} {schema}" for schema, count in counts.items()) + " publicada(s).")
     if args.saida != "-":
         output_path = Path(args.saida)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(
-            json.dumps(spatial_events, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+        output_path.write_text(json.dumps(published, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         print(f"Gravado em: {output_path}")
 
 

@@ -1,12 +1,3 @@
-"""
-Núcleo do componente S1 - Zonas, ocupação e eventos (Camada 3).
-
-Modelos, geometria (zonas e homografia), histerese de entrada/saída e o
-serviço que processa os rastros de I2 quadro a quadro, por câmera. Não
-sabe de onde as mensagens vêm (`s1/ingestion.py`) nem como são
-publicadas (`s1/output.py`).
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -70,6 +61,7 @@ class ZonesArtifact:
 
 class DegenerateHomographyError(ValueError):
     """A homografia projeta o ponto para o infinito (w = 0)."""
+
 class Homography:
     def __init__(self, matrix: List[List[float]]):
         if len(matrix) != 3 or any(len(row) != 3 for row in matrix):
@@ -213,7 +205,6 @@ class HysteresisController:
         enter_hysteresis_ms: int,
         exit_hysteresis_ms: int,
     ) -> Tuple[bool, Optional[datetime]]:
-
         state = self._states.get(key)
         if state is None:
             if not raw_inside:
@@ -240,7 +231,6 @@ class HysteresisController:
         return raw_inside, started_at
 
     def close_track(self, source_id: str, track_id: str) -> List[Tuple[str, Optional[datetime]]]:
-
         closed = []
         for key in [key for key in self._states if key[0] == source_id and key[1] == track_id]:
             state = self._states.pop(key)
@@ -276,10 +266,9 @@ class S1Service:
         self._pending_zones = zones
 
     def start_session(self, session_id: str, sources: List[str], started_at: datetime) -> List[Occupancy]:
-        """Reinicia o estado das câmeras que mudaram de sessão. Devolve a
-        ocupação zerada das zonas que tinham alguém (sem publicar saídas)."""
-
-        changed = [source for source in sources if self._sessions.get(source) != session_id]
+        changed = [
+            source for source in sources if self._in_scope(source) and self._sessions.get(source) != session_id
+        ]
         if not changed:
             return []
         is_change = any(self._sessions.get(source) is not None for source in changed)
@@ -300,13 +289,14 @@ class S1Service:
         return reset
 
     def process_frame(self, frame: Frame) -> Optional[FrameResult]:
-
         source = frame.source_id
-        if frame.session_id in self._ended_sessions:
+        if not self._in_scope(source) or frame.session_id in self._ended_sessions:
             return None
         reset = []
         if self._sessions.get(source) != frame.session_id:
             reset = self.start_session(frame.session_id, [source], frame.captured_at)
+        if source not in self.zones.source_ids:
+            return None  # câmera só do ZONES agendado: espera ele entrar em vigor
         last_index = self._last_frame_index.get(source)
         if last_index is not None and frame.frame_index <= last_index:
             return None
@@ -337,6 +327,12 @@ class S1Service:
         return {
             zone.zone_id: len(self._members.get((source_id, zone.zone_id), {})) for zone in self.zones.zones
         }
+
+    # ----------------------------------------------------------------------
+
+    def _in_scope(self, source: str) -> bool:
+        pending = self._pending_zones
+        return source in self.zones.source_ids or (pending is not None and source in pending.source_ids)
 
     def _observe(
         self, frame: Frame, track: TrackObservation, exits: List[Transition], enters: List[Transition]
@@ -376,10 +372,6 @@ class S1Service:
         )
 
     def _close_track(self, source: str, track: TrackObservation, at: datetime) -> List[Transition]:
-        """Rastro LOST: sai de toda zona em que estava. A saída aconteceu no
-        início da saída pendente, se havia uma; senão, na última vez em que
-        o rastro foi visto."""
-
         last_seen = self._last_seen.pop((source, track.track_id), at)
         return [
             self._exit(source, track.track_id, track.object_class, zone_id, pending_exit or last_seen)

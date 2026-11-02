@@ -1,6 +1,3 @@
-"""Testes da entrada do S1 (s1/ingestion.py): contratos consumidos e
-artefatos ZONES/CALIBRATION."""
-
 import hashlib
 import json
 from pathlib import Path
@@ -11,6 +8,7 @@ from s1.domain import Point
 from s1.ingestion import (
     ArtifactRegistry,
     ContractError,
+    decode_message,
     load_json,
     parse_artifact_published,
     parse_calibration,
@@ -21,6 +19,10 @@ from s1.ingestion import (
 from tests.factories import SESSION, at, calibration_message, raw_track, session_message, tracks_message
 
 DATA_DIR = Path(__file__).parent.parent / "data"
+
+# --------------------------------------------------------------------------
+# ods.i2.tracks
+# --------------------------------------------------------------------------
 
 def test_parse_tracks_reads_envelope_and_payload():
     message = tracks_message(48213, [raw_track("t-0391", 505, 702), raw_track("t-0400", 10, 20, state="LOST")])
@@ -36,6 +38,24 @@ def test_parse_tracks_reads_envelope_and_payload():
 def test_parse_tracks_accepts_empty_frame():
     assert parse_tracks(tracks_message(0, [])).tracks == ()
 
+def test_parse_tracks_accepts_any_minor_version_of_major_1():
+    message = tracks_message(0, [], ms=0)
+    message.update(schema_version="1.3", novo_campo_opcional=True)
+    assert parse_tracks(message).frame_index == 0
+
+def test_parse_tracks_accepts_occurred_at_from_the_kafka_guide():
+    message = tracks_message(0, [], ms=700)
+    message["occurred_at"] = message.pop("captured_at")
+    assert parse_tracks(message).captured_at == at(700)
+
+@pytest.mark.parametrize("raw", [b"{nao e json", b"\xff\xfe", b"[1, 2]", b'"texto"'])
+def test_decode_message_rejects_anything_but_a_json_object(raw):
+    with pytest.raises(ContractError):
+        decode_message(raw)
+
+def test_decode_message_reads_bytes_from_the_bus():
+    assert decode_message(b'{"schema": "ods.i2.tracks"}') == {"schema": "ods.i2.tracks"}
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -44,14 +64,24 @@ def test_parse_tracks_accepts_empty_frame():
         lambda m: m["payload"].pop("frame_index"),
         lambda m: m["payload"]["tracks"][0].update(state="TENTATIVE"),
         lambda m: m["payload"]["tracks"][0].update(point_px=[1]),
+        lambda m: m.update(schema_version="2.0"),
+        lambda m: m.pop("schema_version"),
+        lambda m: m.pop("captured_at"),
     ],
-    ids=["schema-antigo", "sem-session_id", "sem-frame_index", "state-fora-do-enum", "point_px-malformado"],
+    ids=[
+        "schema-antigo", "sem-session_id", "sem-frame_index", "state-fora-do-enum", "point_px-malformado",
+        "versao-maior-2", "sem-schema_version", "sem-captured_at",
+    ],
 )
 def test_parse_tracks_rejects_messages_outside_the_contract(mutate):
     message = tracks_message(0, [raw_track("t-1", 1, 2)])
     mutate(message)
     with pytest.raises(ContractError):
         parse_tracks(message)
+
+# --------------------------------------------------------------------------
+# ods.i3.calibration, ods.session.started, ods.artifact.published
+# --------------------------------------------------------------------------
 
 def test_parse_calibration_takes_source_and_version_from_envelope():
     calibration = parse_calibration(calibration_message(source="cam0", version="cal-cam0-3", space_id="quadra-1"))
@@ -73,6 +103,7 @@ def test_parse_artifact_published():
     descriptor = parse_artifact_published(
         {
             "schema": "ods.artifact.published",
+            "schema_version": "1.0",
             "message_type": "event",
             "producer": "A8",
             "payload": {
@@ -83,6 +114,10 @@ def test_parse_artifact_published():
         }
     )
     assert (descriptor.artifact_id, descriptor.artifact_version, descriptor.kind) == ("zones-a8", "zones-a8-2", "ZONES")
+
+# --------------------------------------------------------------------------
+# ZONES
+# --------------------------------------------------------------------------
 
 def _zones(**overrides):
     content = load_json(DATA_DIR / "zones_exemplo_a8.json")
@@ -139,10 +174,15 @@ def test_parse_zones_rejects_artifacts_outside_the_contract(content):
     with pytest.raises(ContractError):
         parse_zones(content, "v")
 
+# --------------------------------------------------------------------------
+# Registro de artefatos
+# --------------------------------------------------------------------------
+
 def _descriptor(uri, content_bytes):
     return parse_artifact_published(
         {
             "schema": "ods.artifact.published",
+            "schema_version": "1.0",
             "payload": {
                 "artifact_id": "zones-a8", "artifact_version": "zones-a8-2", "kind": "ZONES", "owner": "A8",
                 "uri": uri, "hash_sha256": hashlib.sha256(content_bytes).hexdigest(),

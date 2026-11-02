@@ -1,2 +1,6 @@
+# Produção (o que vai para o container)
 shapely>=2.0
+confluent-kafka>=2.3
+# Testes
 pytest>=8.0
+jsonschema>=4.18

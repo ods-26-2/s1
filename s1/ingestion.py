@@ -1,21 +1,8 @@
-"""Entrada do S1: contratos consumidos e artefatos carregados.
-
-Mensagens (Especificação de interfaces 1.0, arquitetura 6c), todas no
-envelope comum — câmera, sessão e tempo de captura vêm no envelope:
-
-- `ods.i2.tracks`: rastros de um quadro de uma câmera.
-- `ods.i3.calibration`: conteúdo de um artefato CALIBRATION publicado.
-- `ods.session.started`: início de sessão (ao vivo, ou replay após
-  START/SEEK/LOOP/RESTART).
-- `ods.artifact.published`: anúncio de nova versão de artefato.
-
-Artefatos (registro de B5, imutáveis e versionados): ZONES e CALIBRATION.
-"""
-
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -31,28 +18,25 @@ SESSION_STARTED = "ods.session.started"
 ARTIFACT_PUBLISHED = "ods.artifact.published"
 
 _TRACK_STATES = ("CONFIRMED", "LOST")
-
+SUPPORTED_MAJOR = "1"
+TIME_FIELDS = ("captured_at", "occurred_at")
 
 class ContractError(ValueError):
     """Mensagem ou artefato fora do contrato."""
 
-
 def parse_timestamp(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
 
 def _require(obj: Dict, key: str, where: str):
     if obj.get(key) is None:
         raise ContractError(f"{where}: campo obrigatório {key!r} ausente")
     return obj[key]
 
-
 def _require_int(obj: Dict, key: str, where: str) -> int:
     value = _require(obj, key, where)
     if not isinstance(value, int) or isinstance(value, bool):
         raise ContractError(f"{where}: {key!r} deve ser inteiro, recebido {value!r}")
     return value
-
 
 def _point(value, where: str) -> Point:
     try:
@@ -61,12 +45,37 @@ def _point(value, where: str) -> Point:
     except (TypeError, ValueError) as error:
         raise ContractError(f"{where}: esperado [x, y], recebido {value!r}") from error
 
-
 def _expect_schema(message: Dict, schema: str) -> Dict:
     if message.get("schema") != schema:
         raise ContractError(f"esperado schema {schema!r}, recebido {message.get('schema')!r}")
+    check_schema_version(message)
     return _require(message, "payload", schema)
 
+def check_schema_version(message: Dict) -> None:
+    version = message.get("schema_version")
+    if not isinstance(version, str) or version.split(".")[0] != SUPPORTED_MAJOR:
+        raise ContractError(
+            f"{message.get('schema')}: schema_version {version!r} não suportada (o S1 aceita {SUPPORTED_MAJOR}.x)"
+        )
+
+def decode_message(raw: Union[bytes, str]) -> Dict:
+    try:
+        message = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ContractError(f"mensagem não é JSON válido: {error}") from error
+    if not isinstance(message, dict):
+        raise ContractError(f"mensagem deveria ser um objeto JSON, recebido {type(message).__name__}")
+    return message
+
+def captured_at(message: Dict, where: str) -> datetime:
+    """Instante de captura do envelope. A Especificação 1.0 chama o campo de
+    `captured_at`; o guia do Kafka (TRA-1) mostra `occurred_at`. Enquanto os
+    dois documentos não forem alinhados, o S1 aceita qualquer um."""
+
+    for field_name in TIME_FIELDS:
+        if message.get(field_name) is not None:
+            return parse_timestamp(message[field_name])
+    raise ContractError(f"{where}: campo obrigatório 'captured_at' ausente")
 
 def parse_tracks(message: Dict) -> Frame:
     payload = _expect_schema(message, I2_TRACKS)
@@ -88,11 +97,10 @@ def parse_tracks(message: Dict) -> Frame:
         source_id=_require(message, "source_id", I2_TRACKS),
         session_id=_require(message, "session_id", I2_TRACKS),
         frame_index=_require_int(payload, "frame_index", I2_TRACKS),
-        captured_at=parse_timestamp(_require(message, "captured_at", I2_TRACKS)),
+        captured_at=captured_at(message, I2_TRACKS),
         tracks=tuple(tracks),
         message_id=message.get("message_id"),
     )
-
 
 def calibration_from_content(content: Dict, source_id: str, artifact_version: str) -> Calibration:
     reference_frame = _require(content, "reference_frame", "CALIBRATION")
@@ -108,7 +116,6 @@ def calibration_from_content(content: Dict, source_id: str, artifact_version: st
         space_id=_require(reference_frame, "space_id", "CALIBRATION reference_frame"),
     )
 
-
 def parse_calibration(message: Dict) -> Calibration:
     payload = _expect_schema(message, I3_CALIBRATION)
     return calibration_from_content(
@@ -117,13 +124,11 @@ def parse_calibration(message: Dict) -> Calibration:
         artifact_version=_require(message, "artifact_version", I3_CALIBRATION),
     )
 
-
 @dataclass(frozen=True)
 class SessionStart:
     session_id: str
     started_at: datetime
     sources: Tuple[str, ...]
-
 
 def parse_session_started(message: Dict) -> SessionStart:
     payload = _expect_schema(message, SESSION_STARTED)
@@ -132,7 +137,6 @@ def parse_session_started(message: Dict) -> SessionStart:
         started_at=parse_timestamp(_require(payload, "started_at", SESSION_STARTED)),
         sources=tuple(_require(payload, "sources", SESSION_STARTED)),
     )
-
 
 @dataclass(frozen=True)
 class ArtifactDescriptor:
@@ -144,7 +148,6 @@ class ArtifactDescriptor:
     hash_sha256: str
     valid_from: datetime
     schema_version: str
-
 
 def parse_artifact_descriptor(data: Dict) -> ArtifactDescriptor:
     where = "descritor de artefato"
@@ -158,7 +161,6 @@ def parse_artifact_descriptor(data: Dict) -> ArtifactDescriptor:
         valid_from=parse_timestamp(_require(data, "valid_from", where)),
         schema_version=_require(data, "schema_version", where),
     )
-
 
 def parse_artifact_published(message: Dict) -> ArtifactDescriptor:
     return parse_artifact_descriptor(_expect_schema(message, ARTIFACT_PUBLISHED))
@@ -176,7 +178,6 @@ def _parse_zone(raw: Dict, index: int) -> Zone:
         classes=tuple(raw.get("classes") or ()),
     )
 
-
 def parse_zones(content: Dict, artifact_version: str) -> ZonesArtifact:
     try:
         source_ids = _require(content, "source_ids", "ZONES")
@@ -192,12 +193,6 @@ def parse_zones(content: Dict, artifact_version: str) -> ZonesArtifact:
     except ValueError as error:
         raise ContractError(f"ZONES: {error}") from error
 
-# --------------------------------------------------------------------------
-# Registro de artefatos. O registro real é de B5; aqui, uma pasta local em
-# que a URI registry://<caminho> aponta para <raiz>/<caminho>. O conteúdo
-# só é aceito se o sha256 bater com o do descritor.
-# --------------------------------------------------------------------------
-
 class ArtifactRegistry:
     def __init__(self, root: PathLike):
         self._root = Path(root)
@@ -211,12 +206,15 @@ class ArtifactRegistry:
             raise ContractError(f"hash_sha256 não confere para {descriptor.artifact_version}")
         return json.loads(data)
 
-
 def load_json(path: PathLike):
     return json.loads(Path(path).read_text(encoding="utf-8"))
-
 
 def load_messages(path: PathLike) -> List[Dict]:
     """Um arquivo com uma lista de mensagens, na ordem de chegada."""
 
     return list(load_json(path))
+
+def default_artifact_id(artifact_version: str) -> str:
+    """`zones-a8-2` → `zones-a8`: a versão sem o número final."""
+
+    return re.sub(r"-\d+$", "", artifact_version)

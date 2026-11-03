@@ -9,12 +9,14 @@ pixel quando não há calibração.
 ## O que entra e o que sai
 
 ```
-ods.i2.tracks ─────────┐
-ods.i3.calibration ────┤                               ┌─► ods.s1.position        (por quadro e câmera)
-ods.session.started ───┼─► s1/runtime.py ─► S1Service ─┼─► ods.s1.zone_transition (ENTER / EXIT)
-ods.artifact.published ┘      (deduplica,  (domain.py)  └─► ods.s1.zone_occupancy  (por zona e câmera)
-                               roteia)          ▲
-                       artefatos ZONES e CALIBRATION (registro de B5)
+            Kafka (B3)                                                          Kafka (B3)
+ods.i2.tracks ─────────┐                                                ┌─► ods.s1.position        (por quadro e câmera)
+ods.i3.calibration ────┤          s1/runtime.py                      ├─► ods.s1.zone_transition (ENTER / EXIT)
+ods.session.started ───┼─► KafkaBus ─► S1Runtime ──────► S1Service ─┴─► ods.s1.zone_occupancy  (por zona e câmera)
+ods.artifact.published ┘   (JSON,      (versão, deduplica,   (domain.py)
+                            tópicos)    roteia)
+                                                                        ▲
+                                  artefatos ZONES e CALIBRATION (fixados na build / registro de B5)
 ```
 
 | Entrada | Dono | O S1 usa para |
@@ -40,15 +42,18 @@ s1/
   domain.py     # ZONES, geometria, homografia/calibração, histerese e S1Service
   ingestion.py  # leitura dos contratos de entrada e dos artefatos; registro de artefatos
   output.py     # S1Publisher: envelope comum + as três mensagens ods.s1.*
-  runtime.py    # S1Runtime: recebe cada mensagem, deduplica pelo message_id e roteia
+  runtime.py    # S1Runtime (deduplica e roteia cada mensagem) e o adaptador Kafka
+  __main__.py   # `python -m s1`: configuração, partida e o serviço em produção
+contracts/      # JSON Schemas das três mensagens ods.s1.* (com exemplos válidos)
 data/
   zones_a3.json         # ZONES da demonstração (A3, modo PIXELS)
   zones_exemplo_a8.json # ZONES de exemplo da especificação (A8, METERS)
   entrada_demo.json     # mensagens de entrada da demonstração, na ordem de chegada
   i3_calibration.json   # ods.i3.calibration de exemplo (opcional na demonstração)
-  output/eventos_s1.json
-simulate.py             # faz o papel do barramento e mostra o que o S1 publica
-tests/                  # domain, ingestion, output, runtime (+ factories.py)
+simulate.py             # faz o papel das outras equipes, sem Kafka ou num Kafka local
+Dockerfile              # container do S1 (P3)
+docker-compose.yml      # Kafka local + S1, para testar sem o broker da nuvem
+tests/                  # um arquivo de teste por módulo de s1/ (+ factories.py)
 ```
 
 ## Como o S1 funciona
@@ -66,8 +71,10 @@ ponto, sem desempate (o desempate é de S2).
 **Zonas (artefato ZONES).** `coordinates` é `METERS` ou `PIXELS`. Em METERS,
 o ponto testado é `position_m`, e só vale se a calibração for do mesmo
 `space_id` do artefato. Em PIXELS, o ponto testado é `point_px`, e o
-artefato cobre exatamente uma câmera. Só leituras das câmeras em `source_ids`
-são consideradas.
+artefato cobre exatamente uma câmera. **Só as câmeras em `source_ids` são
+deste S1:** no barramento compartilhado chegam quadros e inícios de sessão de
+câmeras de outras aplicações, e o S1 os ignora — não publica posição sobre
+elas, e a sessão delas não reinicia o estado daqui.
 
 **Entrada e saída (histerese).** Cada (câmera, rastro, zona) tem seu estado.
 A entrada só é confirmada depois de `enter_hysteresis_ms` contínuos dentro;
@@ -103,7 +110,7 @@ troca de sessão — ou na hora, se ainda não processou nenhum quadro. A
 calibração chega com o conteúdo em `ods.i3.calibration`; para cada quadro
 vale a de `valid_from` mais recente.
 
-## Saída — envelope comum
+## Saída — envelope comum (perfil EV-SINAL)
 
 Toda mensagem do S1 tem os campos do envelope da Especificação 1.0:
 `message_type`, `message_id` (UUID v4), `schema`, `schema_version`,
@@ -130,18 +137,144 @@ envelope.
 
 (Exemplos com o envelope abreviado, como na especificação.)
 
+## Contratos (JSON Schema)
+
+`contracts/` tem o JSON Schema (draft 2020-12) de cada mensagem que o S1
+publica — `ods.s1.position`, `ods.s1.zone_transition` e
+`ods.s1.zone_occupancy` —, com o envelope completo, para o B1 registrar e o
+B4 gerar o produtor falso e o validador. Cada schema traz exemplos válidos
+no campo `examples`; os exemplos inválidos (um defeito por caso, com nome que
+diz o erro) ficam em `tests/test_output.py`. Os testes conferem os dois e
+também tudo o que o S1 publica na demonstração.
+
 ## Como rodar
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 python -m pip install -r requirements.txt
 
-# Demonstração com A3 de exemplo
+# Demonstração sem Kafka (A3, modo pixel): objeto oscilando na borda do Portão
+# Sul (nunca confirmado) e o "Objeto 99" entrando na Recepção, ocluído e
+# encerrado por I2 (LOST)
 python simulate.py
 
 # A mesma demonstração com a calibração de I3: as posições ganham position_m
 python simulate.py --calibracao data/i3_calibration.json
 
-# Testes
+# Gravar as mensagens publicadas num arquivo
+python simulate.py --saida eventos_s1.json
+
+# Testes (nenhum usa broker de verdade)
 python -m pytest
 ```
+
+### Com um Kafka local
+
+```bash
+docker compose up -d --build    # Kafka local, tópicos e o S1 em container
+python simulate.py --kafka localhost:9092   # publica a demonstração e confere as saídas
+docker compose logs s1
+docker compose down
+```
+
+Com `--kafka`, o simulador faz o papel de I3, P6 e I2 (publica a calibração, o início de sessão
+e os quadros, além de um JSON quebrado, uma mensagem versão 2.0, uma câmera de
+outra aplicação e uma entrega repetida) e confere que as saídas seguem os
+schemas, saem no tópico certo com a chave certa e são iguais às do modo sem Kafka.
+
+### Em produção: `python -m s1`
+
+Toda a configuração vem de variáveis de ambiente — nenhum endereço fica no
+código, porque o broker da nuvem é temporário.
+
+| Variável | Obrigatória | Para quê |
+|---|---|---|
+| `S1_KAFKA_BOOTSTRAP_SERVERS` | sim | `host:porta` do broker |
+| `S1_ZONES_FILE` | sim | conteúdo do ZONES fixado na build |
+| `S1_ZONES_VERSION` | sim | `artifact_version` desse ZONES (ex.: `zones-a3-1`) |
+| `S1_ZONES_ARTIFACT_ID` | não | `artifact_id` acompanhado em `ods.artifact.published` (padrão: a versão sem o `-N`) |
+| `S1_ZONES_SHA256` | não | confere o arquivo do ZONES na partida |
+| `S1_REGISTRY_DIR` | não | pasta do registro de artefatos, para carregar versões anunciadas |
+| `S1_CALIBRATION_FILE` | não | mensagens `ods.i3.calibration` aplicadas na partida |
+| `S1_KAFKA_GROUP_ID` | não | grupo de consumo (padrão: `S1-zonas-<artifact_id>`, um por aplicação) |
+| `S1_KAFKA_<CHAVE>` | não | qualquer chave do librdkafka: `_` vira `.`, `__` vira `_` (`S1_KAFKA_SECURITY_PROTOCOL`, `S1_KAFKA_SASL_USERNAME`...) |
+| `S1_TOPIC_<NOME>` | não | troca o nome de um tópico: `I2_TRACKS`, `I3_CALIBRATION`, `SESSION_STARTED`, `ARTIFACT_PUBLISHED`, `POSITION`, `ZONE_TRANSITION`, `ZONE_OCCUPANCY` (padrão: o nome do schema) |
+| `S1_TIME_FIELD` | não | `captured_at` (especificação, padrão) ou `occurred_at` (guia do Kafka) |
+| `S1_LOG_LEVEL` | não | `INFO` (padrão), `DEBUG`, `WARNING` |
+
+```bash
+docker build -t ods-s1 .
+docker run --rm \
+  -e S1_KAFKA_BOOTSTRAP_SERVERS=<host:porta do broker> \
+  -e S1_ZONES_FILE=/app/data/zones_a3.json -e S1_ZONES_VERSION=zones-a3-1 \
+  ods-s1
+```
+
+Num S1 por aplicação (A3, A5, A8...), cada instância tem o seu ZONES e, por
+isso, o seu grupo de consumo: duas instâncias no mesmo grupo dividiriam as
+mensagens entre si. O ZONES de uma build real pode ser montado por volume
+(`-v ./zones.json:/zones/zones.json:ro -e S1_ZONES_FILE=/zones/zones.json`).
+
+## Operação
+
+**O que o S1 lê e publica.** Assina `ods.i2.tracks`, `ods.i3.calibration`,
+`ods.session.started` e `ods.artifact.published`; publica cada mensagem no
+tópico com o nome do seu `schema`, com **`source_id` como chave**. Com a chave,
+todas as mensagens de uma câmera caem na mesma partição e chegam em ordem.
+Tópicos diferentes não têm ordem entre si: a calibração deve ser publicada
+antes dos quadros que a usam (ou passada em `S1_CALIBRATION_FILE`).
+
+**Volume.** Uma `ods.s1.position` por quadro e por câmera, na taxa de quadros
+de I2 (com I2 a 10 quadros/s, por exemplo, são 10 mensagens/s por câmera).
+Cada mensagem tem cerca de 0,5 kB em JSON compacto, mais ~70 bytes por rastro
+a mais no quadro. Transições e ocupação só saem quando
+algo muda. Não faça testes longos ou de carga no broker da nuvem sem combinar
+com o TRA-1: ele consome os créditos da turma.
+
+**Validação da entrada** (os três níveis do guia do Kafka): (1) o valor tem de
+ser um objeto JSON; (2) o envelope tem de ter o `schema` esperado e
+`schema_version` 1.x — versões menores novas são aceitas (só acrescentam
+campos opcionais, que o S1 ignora), versão maior nova é descartada; (3) o
+payload tem de seguir o contrato. Mensagem reprovada é registrada no log
+(`WARNING`) e descartada; o serviço continua.
+
+**Idempotência.** O S1 descarta mensagens com `message_id` já visto (guarda os
+últimos 10 000), então uma entrega repetida pelo broker não publica nada de
+novo. Quadros repetidos ou fora de ordem (`frame_index` não crescente) também
+são ignorados. As mensagens que o S1 publica têm `message_id` novo (UUID v4),
+para os consumidores deduplicarem do lado deles.
+
+**Falhas.**
+- *Mensagem com problema*: descartada com log; um erro inesperado ao processar
+  uma mensagem também só é registrado (`ERROR`, com o traceback).
+- *Broker fora do ar*: o cliente do Kafka reconecta sozinho; o S1 fica
+  esperando. Ao voltar, o grupo continua de onde parou (offsets confirmados
+  automaticamente).
+- *Falha de entrega*: registrada no log (`falha ao publicar`); o produtor já
+  tenta de novo sozinho antes de desistir.
+- *Configuração inválida* (variável faltando, chave do Kafka inexistente,
+  ZONES com hash errado): o S1 nem começa — sai com código 2 e diz o motivo.
+- *Parada* (`docker stop`, Ctrl+C): termina o laço, entrega o que falta
+  publicar e fecha a conexão; sai com código 0.
+- *Reinício*: o estado (quem está em cada zona) fica só em memória. Ao
+  voltar, o S1 continua lendo de onde o grupo parou, mas começa sem ninguém
+  nas zonas: quem estava dentro ganha uma nova entrada (depois da histerese),
+  e o `dwell_s` da saída passa a contar a partir dela.
+
+## Em aberto (para confirmar com as outras equipes)
+
+- **A4 sem ZONES:** A4 consome o S1, mas não é dono de ZONES. Se o S1 do A4
+  for só para obter `position_m`, ele precisará rodar sem artefato de zonas
+  (`zone_ids` sempre vazio); hoje o S1 exige um ZONES.
+- **`count_by_class`:** o exemplo da especificação mostra `"person": 0` numa
+  vaga que só conta `vehicle`. O S1 publica as classes declaradas na zona
+  (mais as presentes); se a intenção for listar todo o vocabulário do modelo,
+  ele precisa vir de algum artefato.
+- **Registro de B5:** o `ArtifactRegistry` lê o conteúdo de uma pasta local
+  pela URI `registry://…`; o acesso ao registro real depende do que B5
+  definir.
+- **Nomes de tópico e do campo de horário (TRA-1):** a especificação usa
+  `ods.s1.*`/`ods.i2.tracks` e `captured_at`; o guia do Kafka sugere
+  `ods.<domínio>.<evento>` e `occurred_at`. O S1 segue a especificação por
+  padrão, aceita os dois campos na entrada e troca tópicos e campo por
+  configuração (`S1_TOPIC_*`, `S1_TIME_FIELD`), sem mudar o código.

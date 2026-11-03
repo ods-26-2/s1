@@ -1,19 +1,3 @@
-"""
-Saída do S1: as três mensagens da Especificação de interfaces 1.0, no
-envelope comum (perfil EV-SINAL).
-
-- `ods.s1.position`: uma por quadro e câmera, com a lista completa dos
-  rastros CONFIRMED (inclusive vazia).
-- `ods.s1.zone_transition`: uma por entrada ou saída confirmada;
-  `captured_at` é o instante do cruzamento.
-- `ods.s1.zone_occupancy`: uma por zona e câmera a cada mudança de contagem.
-
-`artifact_version` é a versão do ZONES que produziu cada mensagem. `sequence` conta as
-mensagens do S1 por sessão, a partir de 0. `correlation_id` aponta para a
-mensagem que causou a publicação (o quadro de I2 ou o início de sessão).
-O payload nunca repete um campo do envelope.
-"""
-
 from __future__ import annotations
 
 import uuid
@@ -28,7 +12,6 @@ ZONE_OCCUPANCY = "ods.s1.zone_occupancy"
 SCHEMA_VERSION = "1.0"
 PRODUCER = "S1"
 
-
 def format_timestamp(timestamp: datetime) -> str:
     """ISO 8601 em UTC com milissegundos (2026-09-23T14:29:59.870Z)."""
 
@@ -36,19 +19,19 @@ def format_timestamp(timestamp: datetime) -> str:
         timestamp = timestamp.astimezone(timezone.utc)
     return timestamp.strftime("%Y-%m-%dT%H:%M:%S.") + f"{timestamp.microsecond // 1000:03d}Z"
 
-
 def _xy(point: Point) -> List[float]:
     return [point.x, point.y]
-
 
 class S1Publisher:
     def __init__(
         self,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         new_message_id: Callable[[], str] = lambda: str(uuid.uuid4()),
+        time_field: str = "captured_at",
     ):
         self._clock = clock
         self._new_message_id = new_message_id
+        self._time_field = time_field
         self._sequence: Dict[str, int] = {}
 
     def frame_messages(self, result: FrameResult) -> List[Dict]:
@@ -156,7 +139,7 @@ class S1Publisher:
         message.update(
             {
                 "published_at": format_timestamp(self._clock()),
-                "captured_at": format_timestamp(captured_at),
+                self._time_field: format_timestamp(captured_at),
                 "source_id": source_id,
                 "session_id": session_id,
                 "sequence": sequence,

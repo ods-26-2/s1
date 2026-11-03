@@ -1,0 +1,24 @@
+{
+  "coordinates": "PIXELS",
+  "source_ids": ["cam_frontal"],
+  "zones": [
+    {
+      "zone_id": "zona_segura_01",
+      "name": "Recepção",
+      "polygon": [[0, 0], [500, 0], [500, 500], [0, 500]],
+      "enter_hysteresis_ms": 100,
+      "exit_hysteresis_ms": 300,
+      "max_occupancy": 20,
+      "classes": ["person"]
+    },
+    {
+      "zone_id": "zona_proibida_01",
+      "name": "Portão Sul",
+      "polygon": [[510, 0], [1000, 0], [1000, 500], [510, 500]],
+      "enter_hysteresis_ms": 100,
+      "exit_hysteresis_ms": 400,
+      "max_occupancy": 5,
+      "classes": ["person"]
+    }
+  ]
+}

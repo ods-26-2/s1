@@ -1,24 +1,52 @@
 [
   {
     "message_type": "event",
-    "schema": "ods.inferencia.calibracao",
+    "message_id": "d804f31a-a190-51a0-b36f-277647e40055",
+    "schema": "ods.i3.calibration",
     "schema_version": "1.0",
     "producer": "I3",
     "published_at": "2026-09-01T00:00:00.500Z",
+    "source_id": "cam_frontal",
+    "sequence": 0,
+    "artifact_version": "cal-cam_frontal-1",
     "payload": {
-      "camera_id": "cam_frontal",
-      "calibration_version": "calib-frontal-v1",
       "valid_from": "2026-09-01T00:00:00.000Z",
-      "homography": [
-        [0.1, 0.0, 0.0],
-        [0.0, 0.1, 0.0],
-        [0.0, 0.0, 1.0]
+      "image_width": 1920,
+      "image_height": 1080,
+      "intrinsics": {
+        "fx": 1456.2,
+        "fy": 1458.9,
+        "cx": 962.4,
+        "cy": 541.7
+      },
+      "distortion": [
+        -0.312,
+        0.108,
+        0.0004,
+        -0.0002,
+        -0.017
+      ],
+      "homography_px_to_m": [
+        [
+          0.1,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.1,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
       ],
       "reference_frame": {
         "space_id": "galpao_principal",
-        "origin": "canto_inferior_esquerdo_planta",
-        "axes": "x_direita_y_cima",
-        "unit": "metros"
+        "origin": "canto inferior esquerdo da planta",
+        "axes": "x para a direita, y para cima"
       },
       "reprojection_rms_cm": 1.8,
       "holdout_points": 12

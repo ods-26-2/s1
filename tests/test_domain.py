@@ -40,6 +40,10 @@ def _calibrations(*sources, space_id="patio-1", scale=0.01):
 def _events(result):
     return [(t.kind, t.track_id, t.zone_id) for t in result.transitions]
 
+# --------------------------------------------------------------------------
+# Artefato ZONES
+# --------------------------------------------------------------------------
+
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -68,6 +72,10 @@ def test_zone_classes_filter():
     assert square("a", 0, 0, 1, 1).accepts("person")
     assert not square("a", 0, 0, 1, 1, classes=("vehicle",)).accepts("person")
 
+# --------------------------------------------------------------------------
+# Calibração
+# --------------------------------------------------------------------------
+
 def test_homography_projects_raw_pixel_to_meters():
     assert Homography([[0.01, 0, 0], [0, 0.01, 0], [0, 0, 1]]).project(Point(505, 702)) == Point(5.05, 7.02)
 
@@ -81,6 +89,10 @@ def test_calibration_registry_picks_version_valid_at_capture_time():
     assert registry.resolve("cam0", datetime(2026, 9, 25, tzinfo=timezone.utc)).artifact_version == "cal-cam0-2"
     assert registry.resolve("cam0", datetime(2026, 8, 1, tzinfo=timezone.utc)) is None
     assert registry.resolve("cam9", datetime(2026, 9, 25, tzinfo=timezone.utc)) is None
+
+# --------------------------------------------------------------------------
+# Histerese
+# --------------------------------------------------------------------------
 
 def _feed(readings, enter_ms=500, exit_ms=500):
     hysteresis = HysteresisController()
@@ -98,6 +110,10 @@ def test_entry_and_exit_use_different_durations():
 def test_flicker_at_border_is_never_confirmed():
     results = _feed([(0, False), (100, True), (200, False), (300, True), (400, False)], enter_ms=150)
     assert all(inside is False for inside, _ in results)
+
+# --------------------------------------------------------------------------
+# S1Service — posição
+# --------------------------------------------------------------------------
 
 def test_position_has_one_item_per_confirmed_track_and_empty_frames_are_kept():
     service = S1Service(artifact(square("z", 0, 0, 100, 100)))
@@ -128,8 +144,32 @@ def test_overlapping_zones_are_all_reported_without_tie_break():
 
 def test_ignores_cameras_outside_source_ids():
     service = S1Service(artifact(square("z", 0, 0, 100, 100, enter_ms=0)))
-    result = service.process_frame(frame(0, track("t-1", 10, 10), source="cam9"))
-    assert result.positions[0].zone_ids == () and result.transitions == ()
+    assert service.process_frame(frame(0, track("t-1", 10, 10), source="cam9")) is None
+
+def test_session_of_cameras_outside_source_ids_does_not_reset_state():
+    service = S1Service(artifact(square("z", 0, 0, 100, 100, 0, 0)))
+    service.process_frame(frame(0, track("t-1", 10, 10)))
+    service.schedule_zones(artifact(square("z", 0, 0, 100, 100, 0, 0), version="zones-t-2"))
+
+    assert service.start_session("outra-sessao", ["cam9"], at(500)) == []
+    assert service.start_session("mais-outra", ["cam9"], at(600)) == []
+    assert service.occupancy_snapshot("cam0") == {"z": 1}
+    assert service.zones.artifact_version == "zones-t-1"
+
+def test_camera_only_in_scheduled_zones_waits_for_it():
+    service = S1Service(artifact(square("z", 0, 0, 100, 100, 0, 0)))
+    service.process_frame(frame(0, track("t-1", 10, 10)))
+    service.schedule_zones(artifact(square("z", 0, 0, 100, 100, 0, 0), source_ids=("cam1",), version="zones-t-2"))
+
+    assert service.process_frame(frame(0, track("t-2", 10, 10), source="cam1")) is None
+    service.start_session("nova", ["cam0", "cam1"], at(1000))
+    result = service.process_frame(frame(1, track("t-2", 10, 10), source="cam1", session="nova", ms=1100))
+    assert result.artifact_version == "zones-t-2" and result.positions[0].zone_ids == ("z",)
+    assert service.process_frame(frame(2, track("t-1", 10, 10), session="nova", ms=1200)) is None
+
+# --------------------------------------------------------------------------
+# S1Service — transição e ocupação
+# --------------------------------------------------------------------------
 
 def _demo_service():
     return S1Service(
@@ -197,8 +237,7 @@ def test_lost_track_never_confirmed_produces_nothing():
     assert result.transitions == () and result.occupancy_changes == ()
 
 def test_occupancy_is_per_camera():
-    """Duas câmeras vendo a mesma pessoa: cada uma conta 1 na sua
-    ocupação; quem funde as câmeras é S2."""
+    """Duas câmeras vendo a mesma pessoa: cada uma conta 1 na sua ocupação"""
 
     zones = artifact(square("vaga-12", 3, 6.5, 5.5, 11.5, 0, 0), coordinates=METERS, source_ids=("cam0", "cam1"), space_id="patio-1")
     service = S1Service(zones, _calibrations("cam0", "cam1"))
@@ -238,6 +277,10 @@ def test_zone_only_counts_its_classes_but_position_reports_geometry():
     assert [p.zone_ids for p in result.positions] == [("vaga-12",), ("vaga-12",)]
     assert _events(result) == [(ENTER, "c-1", "vaga-12")]
     assert result.occupancy_changes[0].count_by_class == {"vehicle": 1}
+
+# --------------------------------------------------------------------------
+# S1Service — sessão e ordem dos quadros
+# --------------------------------------------------------------------------
 
 def test_new_session_resets_state_without_fake_exits():
     """Replay com SEEK/LOOP: o tempo de captura volta. O estado da sessão

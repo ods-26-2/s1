@@ -1,12 +1,19 @@
-"""Testes da saída do S1 (s1/output.py): envelope comum e os três
-contratos ods.s1.*."""
+"""Testes da saída do S1 (s1/output.py): envelope comum, os três contratos
+ods.s1.* e os JSON Schemas de contracts/."""
 
+import copy
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
-from s1.domain import ENTER, EXIT, FrameResult, Occupancy, Point, PositionItem, Transition
-from s1.output import S1Publisher, format_timestamp
-from tests.factories import SESSION, at, frame
+import jsonschema
+import pytest
+
+from s1.domain import ENTER, EXIT, FrameResult, Occupancy, Point, PositionItem, S1Service, Transition
+from s1.ingestion import load_json, load_messages, parse_zones
+from s1.output import POSITION, ZONE_OCCUPANCY, ZONE_TRANSITION, S1Publisher, format_timestamp
+from s1.runtime import S1Runtime
+from tests.factories import SESSION, at, calibration_message, frame, raw_track, session_message, tracks_message
 
 PUBLISHED_AT = datetime(2026, 9, 23, 14, 30, 0, 120_000, tzinfo=timezone.utc)
 ENVELOPE_FIELDS = [
@@ -106,3 +113,100 @@ def test_payload_never_repeats_envelope_fields():
     messages = _publisher().frame_messages(_result([_position(Point(1, 2))], [transition], [_occupancy(count=1)]))
     for message in messages:
         assert not set(message["payload"]) & set(ENVELOPE_FIELDS)
+
+def test_time_field_can_follow_the_kafka_guide_name():
+    (message,) = S1Publisher(clock=lambda: PUBLISHED_AT, time_field="occurred_at").frame_messages(_result())
+    assert "captured_at" not in message
+    assert message["occurred_at"] == format_timestamp(at(500))
+
+# --------------------------------------------------------------------------
+# JSON Schemas (contracts/)
+# --------------------------------------------------------------------------
+
+ROOT = Path(__file__).parent.parent
+SCHEMAS = (POSITION, ZONE_TRANSITION, ZONE_OCCUPANCY)
+
+def _schema(name):
+    return load_json(ROOT / "contracts" / f"{name}.schema.json")
+
+def _validator(name):
+    schema = _schema(name)
+    jsonschema.Draft202012Validator.check_schema(schema)
+    return jsonschema.Draft202012Validator(schema, format_checker=jsonschema.FormatChecker())
+
+def _example(name, index=0):
+    return copy.deepcopy(_schema(name)["examples"][index])
+
+def _set(path, value):
+    def apply(message):
+        *parents, last = path
+        for key in parents:
+            message = message[key]
+        message[last] = value
+    return apply
+
+def _drop(*path):
+    def apply(message):
+        *parents, last = path
+        for key in parents:
+            message = message[key]
+        del message[last]
+    return apply
+
+# Exemplo de partida (índice em "examples" do schema) + o defeito aplicado.
+# Posição: 0 = em metros. Transição: 0 = ENTER, 1 = EXIT. Ocupação: 0 = ocupada.
+INVALID = {
+    "position-sem-frame_index": (POSITION, 0, _drop("payload", "frame_index")),
+    "position-position_m-sem-space_id": (POSITION, 0, _drop("payload", "positions", 0, "space_id")),
+    "position-point_px-com-3-numeros": (POSITION, 0, _set(("payload", "positions", 0, "point_px"), [1, 2, 3])),
+    "position-payload-repete-source_id": (POSITION, 0, _set(("payload", "source_id"), "cam0")),
+    "position-producer-errado": (POSITION, 0, _set(("producer",), "S2")),
+    "position-versao-maior-2": (POSITION, 0, _set(("schema_version",), "2.0")),
+    "position-sem-captured_at": (POSITION, 0, _drop("captured_at")),
+    "position-horario-sem-milissegundos": (POSITION, 0, _set(("captured_at",), "2026-09-23T14:29:59Z")),
+    "position-session_id-nao-uuid": (POSITION, 0, _set(("session_id",), "sessao-1")),
+    "transition-session_id-nao-uuid": (ZONE_TRANSITION, 0, _set(("session_id",), "sessao-1")),
+    "occupancy-session_id-nao-uuid": (ZONE_OCCUPANCY, 0, _set(("session_id",), "sessao-1")),
+    "transition-exit-sem-dwell_s": (ZONE_TRANSITION, 1, _drop("payload", "dwell_s")),
+    "transition-enter-com-dwell_s": (ZONE_TRANSITION, 0, _set(("payload", "dwell_s"), 0)),
+    "transition-dwell_s-fracionario": (ZONE_TRANSITION, 1, _set(("payload", "dwell_s"), 8395.4)),
+    "transition-transition-minusculo": (ZONE_TRANSITION, 0, _set(("payload", "transition"), "enter")),
+    "occupancy-count-negativo": (ZONE_OCCUPANCY, 0, _set(("payload", "count"), -1)),
+    "occupancy-sem-track_ids": (ZONE_OCCUPANCY, 0, _drop("payload", "track_ids")),
+    "occupancy-campo-fora-do-contrato": (ZONE_OCCUPANCY, 0, _set(("payload", "occupancy_rate"), 1.0)),
+}
+
+@pytest.mark.parametrize("name", SCHEMAS)
+def test_schema_examples_are_valid(name):
+    validator = _validator(name)
+    assert _schema(name)["examples"]
+    for example in _schema(name)["examples"]:
+        validator.validate(example)
+
+@pytest.mark.parametrize("case", INVALID, ids=list(INVALID))
+def test_messages_outside_the_contract_fail_the_schema(case):
+    name, index, defect = INVALID[case]
+    message = _example(name, index)
+    defect(message)
+    assert not _validator(name).is_valid(message)
+
+def test_everything_the_s1_publishes_matches_its_schema():
+    zones = parse_zones(load_json(ROOT / "data" / "zones_a3.json"), "zones-a3-1")
+    runtime = S1Runtime(S1Service(zones), S1Publisher(), zones_artifact_id="zones-a3")
+    incoming = load_messages(ROOT / "data" / "i3_calibration.json") + load_messages(ROOT / "data" / "entrada_demo.json")
+    # Um início de sessão no fim gera também a ocupação zerada.
+    incoming.append(session_message("33333333-3333-4333-8333-333333333333", sources=("cam_frontal",)))
+    published = [out for message in incoming for out in runtime.handle(message)]
+
+    assert {message["schema"] for message in published} == set(SCHEMAS)
+    validators = {name: _validator(name) for name in SCHEMAS}
+    for message in published:
+        validators[message["schema"]].validate(message)
+
+def test_position_in_meters_matches_the_schema():
+    zones = parse_zones(load_json(ROOT / "data" / "zones_exemplo_a8.json"), "zones-a8-2")
+    runtime = S1Runtime(S1Service(zones), S1Publisher(), zones_artifact_id="zones-a8")
+    runtime.handle(calibration_message(source="cam0", space_id="patio-1", scale=0.01))
+    position = runtime.handle(tracks_message(0, [raw_track("t-1", 400, 900, object_class="vehicle")]))[0]
+    assert "position_m" in position["payload"]["positions"][0]
+    _validator(POSITION).validate(position)

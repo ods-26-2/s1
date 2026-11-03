@@ -67,10 +67,11 @@ def test_decode_message_reads_bytes_from_the_bus():
         lambda m: m.update(schema_version="2.0"),
         lambda m: m.pop("schema_version"),
         lambda m: m.pop("captured_at"),
+        lambda m: m.update(session_id="sessao-1"),
     ],
     ids=[
         "schema-antigo", "sem-session_id", "sem-frame_index", "state-fora-do-enum", "point_px-malformado",
-        "versao-maior-2", "sem-schema_version", "sem-captured_at",
+        "versao-maior-2", "sem-schema_version", "sem-captured_at", "session_id-nao-uuid",
     ],
 )
 def test_parse_tracks_rejects_messages_outside_the_contract(mutate):
@@ -96,8 +97,12 @@ def test_parse_calibration_rejects_missing_homography():
         parse_calibration(message)
 
 def test_parse_session_started():
-    session = parse_session_started(session_message("s-2", sources=("cam0", "mic0"), ms=1000))
-    assert (session.session_id, session.started_at, session.sources) == ("s-2", at(1000), ("cam0", "mic0"))
+    session = parse_session_started(session_message(SESSION, sources=("cam0", "mic0"), ms=1000))
+    assert (session.session_id, session.started_at, session.sources) == (SESSION, at(1000), ("cam0", "mic0"))
+
+def test_parse_session_started_rejects_session_id_that_is_not_uuid():
+    with pytest.raises(ContractError):
+        parse_session_started(session_message("s-2"))
 
 def test_parse_artifact_published():
     descriptor = parse_artifact_published(

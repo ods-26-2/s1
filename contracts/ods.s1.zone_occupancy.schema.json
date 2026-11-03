@@ -61,7 +61,9 @@
     },
     "session_id": {
       "type": "string",
-      "minLength": 1
+      "format": "uuid",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+      "description": "Sessão de captura ou replay (UUID), copiada da entrada."
     },
     "sequence": {
       "type": "integer",

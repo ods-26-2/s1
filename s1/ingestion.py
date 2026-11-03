@@ -20,6 +20,7 @@ ARTIFACT_PUBLISHED = "ods.artifact.published"
 _TRACK_STATES = ("CONFIRMED", "LOST")
 SUPPORTED_MAJOR = "1"
 TIME_FIELDS = ("captured_at", "occurred_at")
+UUID_PATTERN = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 class ContractError(ValueError):
     """Mensagem ou artefato fora do contrato."""
@@ -31,6 +32,12 @@ def _require(obj: Dict, key: str, where: str):
     if obj.get(key) is None:
         raise ContractError(f"{where}: campo obrigatório {key!r} ausente")
     return obj[key]
+
+def _require_uuid(obj: Dict, key: str, where: str) -> str:
+    value = _require(obj, key, where)
+    if not isinstance(value, str) or not UUID_PATTERN.fullmatch(value):
+        raise ContractError(f"{where}: {key!r} deve ser um UUID, recebido {value!r}")
+    return value
 
 def _require_int(obj: Dict, key: str, where: str) -> int:
     value = _require(obj, key, where)
@@ -95,7 +102,7 @@ def parse_tracks(message: Dict) -> Frame:
         )
     return Frame(
         source_id=_require(message, "source_id", I2_TRACKS),
-        session_id=_require(message, "session_id", I2_TRACKS),
+        session_id=_require_uuid(message, "session_id", I2_TRACKS),
         frame_index=_require_int(payload, "frame_index", I2_TRACKS),
         captured_at=captured_at(message, I2_TRACKS),
         tracks=tuple(tracks),
@@ -133,7 +140,7 @@ class SessionStart:
 def parse_session_started(message: Dict) -> SessionStart:
     payload = _expect_schema(message, SESSION_STARTED)
     return SessionStart(
-        session_id=_require(message, "session_id", SESSION_STARTED),
+        session_id=_require_uuid(message, "session_id", SESSION_STARTED),
         started_at=parse_timestamp(_require(payload, "started_at", SESSION_STARTED)),
         sources=tuple(_require(payload, "sources", SESSION_STARTED)),
     )

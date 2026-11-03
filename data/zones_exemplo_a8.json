@@ -1,0 +1,16 @@
+{
+  "space_id": "patio-1",
+  "coordinates": "METERS",
+  "source_ids": ["cam0", "cam1"],
+  "zones": [
+    {
+      "zone_id": "vaga-12",
+      "name": "Vaga 12",
+      "polygon": [[3.0, 6.5], [5.5, 6.5], [5.5, 11.5], [3.0, 11.5]],
+      "enter_hysteresis_ms": 500,
+      "exit_hysteresis_ms": 1500,
+      "max_occupancy": 1,
+      "classes": ["vehicle"]
+    }
+  ]
+}

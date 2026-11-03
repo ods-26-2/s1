@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ods.ufsj/contracts/ods.s1.zone_transition/1.0.json",
+  "title": "ods.s1.zone_transition",
+  "description": "Uma por entrada ou saída confirmada pela histerese; captured_at é o instante do cruzamento.",
+  "type": "object",
+  "required": [
+    "message_type",
+    "message_id",
+    "schema",
+    "schema_version",
+    "producer",
+    "published_at",
+    "captured_at",
+    "source_id",
+    "session_id",
+    "sequence",
+    "artifact_version",
+    "payload"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "message_type": {
+      "const": "event"
+    },
+    "message_id": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "description": "UUID v4; consumidores deduplicam por ele."
+    },
+    "schema": {
+      "const": "ods.s1.zone_transition"
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^1\\.\\d+$"
+    },
+    "producer": {
+      "const": "S1"
+    },
+    "correlation_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "message_id da mensagem de entrada que causou esta (quadro de I2 ou início de sessão)."
+    },
+    "published_at": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+      "description": "ISO 8601 em UTC com milissegundos."
+    },
+    "captured_at": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+      "description": "ISO 8601 em UTC com milissegundos."
+    },
+    "source_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Câmera."
+    },
+    "session_id": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+      "description": "Sessão de captura ou replay (UUID), copiada da entrada."
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Contador das mensagens do S1 por sessão, a partir de 0."
+    },
+    "artifact_version": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Versão do ZONES que produziu a mensagem."
+    },
+    "payload": {
+      "type": "object",
+      "required": [
+        "track_id",
+        "class",
+        "zone_id",
+        "transition",
+        "entered_at"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "track_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "class": {
+          "type": "string",
+          "minLength": 1
+        },
+        "zone_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "transition": {
+          "enum": [
+            "ENTER",
+            "EXIT"
+          ]
+        },
+        "entered_at": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+          "description": "ISO 8601 em UTC com milissegundos."
+        },
+        "dwell_s": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Permanência em segundos; só em EXIT."
+        }
+      },
+      "if": {
+        "properties": {
+          "transition": {
+            "const": "EXIT"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "dwell_s"
+        ]
+      },
+      "else": {
+        "not": {
+          "required": [
+            "dwell_s"
+          ]
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "message_type": "event",
+      "message_id": "9c4e2a17-3b5d-4f6a-8e9b-0c1d2e3f4a03",
+      "schema": "ods.s1.zone_transition",
+      "schema_version": "1.0",
+      "producer": "S1",
+      "correlation_id": "5b1d2c3e-8f4a-4b6c-9d7e-1a2b3c4d5e6f",
+      "published_at": "2026-09-23T14:30:00.120Z",
+      "captured_at": "2026-09-23T12:10:04.200Z",
+      "source_id": "cam0",
+      "session_id": "3f2a9c1e-7b4d-4e8a-9f6c-2d1b0a9e8c7f",
+      "sequence": 3,
+      "artifact_version": "zones-a8-2",
+      "payload": {
+        "track_id": "t-0391",
+        "class": "vehicle",
+        "zone_id": "vaga-12",
+        "transition": "ENTER",
+        "entered_at": "2026-09-23T12:10:04.200Z"
+      }
+    },
+    {
+      "message_type": "event",
+      "message_id": "9c4e2a17-3b5d-4f6a-8e9b-0c1d2e3f4a04",
+      "schema": "ods.s1.zone_transition",
+      "schema_version": "1.0",
+      "producer": "S1",
+      "correlation_id": "5b1d2c3e-8f4a-4b6c-9d7e-1a2b3c4d5e6f",
+      "published_at": "2026-09-23T14:30:00.120Z",
+      "captured_at": "2026-09-23T14:29:59.200Z",
+      "source_id": "cam0",
+      "session_id": "3f2a9c1e-7b4d-4e8a-9f6c-2d1b0a9e8c7f",
+      "sequence": 4,
+      "artifact_version": "zones-a8-2",
+      "payload": {
+        "track_id": "t-0391",
+        "class": "vehicle",
+        "zone_id": "vaga-12",
+        "transition": "EXIT",
+        "entered_at": "2026-09-23T12:10:04.200Z",
+        "dwell_s": 8395
+      }
+    }
+  ]
+}

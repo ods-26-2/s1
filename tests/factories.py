@@ -1,5 +1,3 @@
-"""Construtores de zonas, quadros e mensagens usados pelos testes."""
-
 from __future__ import annotations
 
 import uuid
@@ -16,7 +14,6 @@ SESSION = "11111111-1111-4111-8111-111111111111"
 def at(ms: float) -> datetime:
     return T0 + timedelta(milliseconds=ms)
 
-
 def square(zone_id, x0, y0, x1, y1, enter_ms=100, exit_ms=100, **kwargs) -> Zone:
     return Zone(
         zone_id=zone_id,
@@ -27,7 +24,6 @@ def square(zone_id, x0, y0, x1, y1, enter_ms=100, exit_ms=100, **kwargs) -> Zone
         **kwargs,
     )
 
-
 def artifact(*zones, coordinates=PIXELS, source_ids=("cam0",), space_id=None, version="zones-t-1") -> ZonesArtifact:
     return ZonesArtifact(
         artifact_version=version,
@@ -37,10 +33,8 @@ def artifact(*zones, coordinates=PIXELS, source_ids=("cam0",), space_id=None, ve
         space_id=space_id,
     )
 
-
 def track(track_id, x, y, object_class="person", lost=False) -> TrackObservation:
     return TrackObservation(track_id, object_class, Point(x, y), lost)
-
 
 def frame(index, *tracks, ms=None, source="cam0", session=SESSION, message_id=None) -> Frame:
     return Frame(
@@ -51,7 +45,6 @@ def frame(index, *tracks, ms=None, source="cam0", session=SESSION, message_id=No
         tracks=tuple(tracks),
         message_id=message_id,
     )
-
 
 def tracks_message(
     index: int, tracks: List[Dict], ms: Optional[float] = None, source="cam0", session=SESSION, message_id=None
@@ -72,7 +65,6 @@ def tracks_message(
         "payload": {"frame_index": index, "tracks": tracks},
     }
 
-
 def raw_track(track_id, x, y, object_class="person", state="CONFIRMED") -> Dict:
     return {
         "track_id": track_id,
@@ -83,7 +75,6 @@ def raw_track(track_id, x, y, object_class="person", state="CONFIRMED") -> Dict:
         "point_px": [x, y],
         "bbox": [x - 40, y - 180, x + 40, y],
     }
-
 
 def session_message(session_id: str, sources=("cam0",), ms: float = 0, message_id=None) -> Dict:
     started = format_timestamp(at(ms))
@@ -100,7 +91,6 @@ def session_message(session_id: str, sources=("cam0",), ms: float = 0, message_i
         "sequence": 0,
         "payload": {"mode": "REPLAY", "started_at": started, "sources": list(sources), "reason": "SEEK"},
     }
-
 
 def calibration_message(source="cam0", version="cal-cam0-1", space_id="patio-1", scale=0.01) -> Dict:
     return {

@@ -1,3 +1,23 @@
+"""Ligação entre o barramento e o S1.
+
+- `S1Runtime`: recebe cada mensagem assinada, descarta repetidas pelo
+  message_id, encaminha pelo schema e devolve as mensagens a publicar.
+- `Topics`: o tópico de cada mensagem (padrão: o nome do schema).
+- `KafkaBus`: o laço do Kafka — lê dos tópicos de entrada, entrega ao
+  S1Runtime e publica cada saída no tópico do seu schema, com `source_id`
+  como chave. Com a chave, todas as mensagens de uma câmera caem na mesma
+  partição e chegam em ordem. Antes de publicar, cada saída passa pelo
+  validador dos contratos (`ods-validator`, da TRA-1); uma saída recusada
+  não vai para o barramento e fica registrada no log.
+
+Assinaturas do S1 (arquitetura 6c): ods.i2.tracks, ods.i3.calibration,
+ods.session.started e ods.artifact.published. A arquitetura também permite
+ods.i1.detections e ods.p6.replay.state, mas nenhuma saída do S1 depende
+deles; mensagens de outros schemas são ignoradas. Uma mensagem com problema
+(JSON inválido, fora do contrato, erro inesperado) é registrada no log e
+descartada; o serviço continua.
+"""
+
 from __future__ import annotations
 
 import json
@@ -74,6 +94,7 @@ class S1Runtime:
 
         if schema == ARTIFACT_PUBLISHED:
             descriptor = parse_artifact_published(message)
+            # CALIBRATION também chega com o conteúdo em ods.i3.calibration.
             if descriptor.kind == "ZONES" and descriptor.artifact_id == self._zones_artifact_id:
                 if self._registry is None:
                     raise ContractError("ZONES anunciado, mas o S1 está sem registro de artefatos")
@@ -91,6 +112,10 @@ TOPIC_PREFIX = "S1_TOPIC_"
 
 @dataclass(frozen=True)
 class Topics:
+    """Tópico de cada mensagem. O padrão é o próprio nome do schema, como na
+    Especificação de interfaces 1.0; cada um pode ser trocado por
+    `S1_TOPIC_<NOME DO CAMPO EM MAIÚSCULAS>` (ex.: `S1_TOPIC_I2_TRACKS`)."""
+
     i2_tracks: str = I2_TRACKS
     i3_calibration: str = I3_CALIBRATION
     session_started: str = SESSION_STARTED
@@ -116,18 +141,32 @@ class Topics:
                 overrides[topic_field.name] = value
         return cls(**overrides)
 
-
 def encode_message(message: Dict) -> bytes:
+    """JSON compacto: payloads pequenos (guia do Kafka)."""
     return json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 class KafkaBus:
-    def __init__(self, runtime: S1Runtime, consumer, producer, topics: Topics, poll_timeout_s: float = 1.0):
+    def __init__(
+        self,
+        runtime: S1Runtime,
+        consumer,
+        producer,
+        topics: Topics,
+        poll_timeout_s: float = 1.0,
+        validator=None,
+    ):
+        """`validator`: objeto com `validate(message)` que lança ValueError
+        (o `ContractError` do ods-validator) se a mensagem estiver fora do
+        contrato. Sem ele, publica sem validar (só nos testes)."""
+
         self._runtime = runtime
         self._consumer = consumer
         self._producer = producer
         self._topics = topics
         self._poll_timeout_s = poll_timeout_s
+        self._validator = validator
         self.delivery_failures = 0
+        self.rejected = 0
 
     def start(self) -> None:
         topics = self._topics.inputs()
@@ -135,6 +174,8 @@ class KafkaBus:
         logger.info("S1 assinando %s", ", ".join(topics))
 
     def poll_once(self) -> int:
+        """Processa no máximo uma mensagem; devolve quantas o S1 publicou."""
+
         record = self._consumer.poll(self._poll_timeout_s)
         self._producer.poll(0)  # atende os avisos de entrega pendentes
         if record is None:
@@ -162,12 +203,28 @@ class KafkaBus:
         return len(outputs)
 
     def publish(self, message: Dict) -> None:
+        if self._validator is not None:
+            # Valida pelo campo `schema`, não pelo nome do tópico: o tópico
+            # pode ter sido renomeado por S1_TOPIC_*.
+            try:
+                self._validator.validate(message)
+            except ValueError as problem:
+                self.rejected += 1
+                details = "; ".join(getattr(problem, "errors", None) or [str(problem)])
+                logger.error(
+                    "saída fora do contrato, NÃO publicada (%s, %s): %s",
+                    message.get("schema"),
+                    message.get("message_id"),
+                    details,
+                )
+                return
         topic = self._topics.output_for(message["schema"])
         key = message["source_id"].encode("utf-8")
         value = encode_message(message)
         try:
             self._producer.produce(topic, key=key, value=value, on_delivery=self._on_delivery)
         except BufferError:
+            # Fila local do produtor cheia: espera as entregas pendentes e tenta de novo.
             self._producer.poll(1.0)
             self._producer.produce(topic, key=key, value=value, on_delivery=self._on_delivery)
 

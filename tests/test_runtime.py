@@ -217,14 +217,14 @@ class FakeProducer:
         self.flushed = True
         return 0
 
-def _bus(records=(), topics=Topics(), producer=None, runtime=None):
+def _bus(records=(), topics=Topics(), producer=None, runtime=None, validator=None):
     runtime = runtime or S1Runtime(
         S1Service(artifact(square("z", 0, 0, 100, 100, 0, 0), version="zones-t-1")),
         S1Publisher(),
         zones_artifact_id="zones-t",
     )
     consumer, producer = FakeConsumer(records), producer or FakeProducer()
-    return KafkaBus(runtime, consumer, producer, topics, poll_timeout_s=0), consumer, producer
+    return KafkaBus(runtime, consumer, producer, topics, poll_timeout_s=0, validator=validator), consumer, producer
 
 def _record(message, **kwargs):
     return FakeRecord(encode_message(message), **kwargs)
@@ -308,9 +308,57 @@ def test_run_processes_until_stopped_then_flushes_and_closes():
     assert len(producer.produced) == 3
     assert producer.flushed and consumer.closed
 
+
 def test_duplicate_delivery_from_the_broker_is_published_once():
     message = tracks_message(0, [])
     bus, _, producer = _bus([_record(message), _record(message)])
     bus.poll_once()
     bus.poll_once()
     assert len(producer.produced) == 1
+
+# --------------------------------------------------------------------------
+# Validação antes de publicar (ods-validator, da TRA-1)
+# --------------------------------------------------------------------------
+
+class RejectingValidator:
+    """Recusa as mensagens de um schema, como o ContractError do ods-validator."""
+
+    def __init__(self, schema):
+        self.schema = schema
+
+    def validate(self, message):
+        if message["schema"] == self.schema:
+            error = ValueError("fora do contrato")
+            error.errors = ["(raiz): 'producer' is a required property"]
+            raise error
+        return message["schema"]
+
+def test_output_rejected_by_the_validator_is_not_published(caplog):
+    bus, _, producer = _bus(
+        [_record(tracks_message(0, [raw_track("t-1", 50, 50)]))],
+        validator=RejectingValidator("ods.s1.zone_transition"),
+    )
+    with caplog.at_level(logging.ERROR):
+        bus.poll_once()
+
+    assert [topic for topic, _, _ in producer.produced] == ["ods.s1.position", "ods.s1.zone_occupancy"]
+    assert bus.rejected == 1
+    assert "NÃO publicada" in caplog.text and "'producer' is a required property" in caplog.text
+
+def test_official_validator_accepts_every_s1_output():
+    """As saídas reais do S1 (posição, entrada, ocupação, saída) passam no
+    ods-validator fixado no requirements.txt."""
+
+    from ods_validator import Validator
+
+    frames = [
+        tracks_message(0, [raw_track("t-1", 50, 50)]),
+        tracks_message(1, [raw_track("t-1", 50, 50, state="LOST")]),
+    ]
+    bus, _, producer = _bus([_record(message) for message in frames], validator=Validator())
+    bus.poll_once()
+    bus.poll_once()
+
+    schemas = {json.loads(value)["schema"] for _, _, value in producer.produced}
+    assert schemas == {"ods.s1.position", "ods.s1.zone_transition", "ods.s1.zone_occupancy"}
+    assert bus.rejected == 0

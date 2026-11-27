@@ -1,6 +1,7 @@
 # Produção (o que vai para o container)
 shapely>=2.0
 confluent-kafka>=2.3
+ods-validator==0.1.0
 # Testes
 pytest>=8.0
 jsonschema>=4.18

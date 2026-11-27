@@ -7,7 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from s1.__main__ import ConfigError, S1Config, build_runtime, create_clients, kafka_key, load_pinned_zones
+from s1.__main__ import (
+    ConfigError,
+    S1Config,
+    build_bus,
+    build_runtime,
+    create_clients,
+    kafka_key,
+    load_pinned_zones,
+)
 from s1.ingestion import ContractError, default_artifact_id
 from s1.runtime import Topics
 from tests.factories import raw_track, tracks_message
@@ -129,3 +137,16 @@ def test_real_confluent_kafka_clients_accept_the_generated_configuration():
     consumer, producer = create_clients(config)
     consumer.close()
     assert producer.flush(0) == 0
+
+def test_bus_validates_outputs_with_the_official_validator():
+    class Producer:
+        produced = []
+
+        def produce(self, topic, key=None, value=None, on_delivery=None):
+            self.produced.append(topic)
+
+    config = S1Config.from_env(_env())
+    bus = build_bus(config, build_runtime(config), clients=(object(), Producer()))
+    bus.publish({"schema": "ods.s1.position", "source_id": "cam_frontal"})  # sem producer, payload...
+
+    assert Producer.produced == [] and bus.rejected == 1

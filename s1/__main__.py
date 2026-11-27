@@ -198,9 +198,29 @@ def create_clients(config: S1Config) -> Tuple[object, object]:
     return Consumer(config.consumer_config), Producer(config.producer_config)
 
 
-def build_bus(config: S1Config, runtime: S1Runtime, clients: Optional[Tuple[object, object]] = None) -> KafkaBus:
+def create_validator():
+    """Validador oficial dos contratos da Especificação 1.0 (ods-validator,
+    da TRA-1). Os schemas vêm dentro do pacote; a versão fica fixada no
+    requirements.txt."""
+
+    from ods_validator import Validator
+
+    validator = Validator()
+    info = validator.schemas_version
+    logger.info(
+        "validando as saídas com ods-validator %s (%d schemas)", info.get("description", "?"), info.get("count", 0)
+    )
+    return validator
+
+
+def build_bus(
+    config: S1Config,
+    runtime: S1Runtime,
+    clients: Optional[Tuple[object, object]] = None,
+    validator=None,
+) -> KafkaBus:
     consumer, producer = clients or create_clients(config)
-    return KafkaBus(runtime, consumer, producer, config.topics)
+    return KafkaBus(runtime, consumer, producer, config.topics, validator=validator or create_validator())
 
 
 # --------------------------------------------------------------------------

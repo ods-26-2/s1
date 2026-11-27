@@ -152,6 +152,15 @@ no campo `examples`; os exemplos inválidos (um defeito por caso, com nome que
 diz o erro) ficam em `tests/test_output.py`. Os testes conferem os dois e
 também tudo o que o S1 publica na demonstração.
 
+**Validação antes de publicar.** Em produção, cada saída passa pelo
+validador oficial dos contratos, o `ods-validator` da TRA-1 (repositório
+`ods-26-2/b1`, versão fixada no `requirements.txt`). Uma saída recusada não
+vai para o barramento: o S1 registra `saída fora do contrato, NÃO publicada`
+no log, com o motivo, e segue para a próxima. Os schemas da versão 0.1.0 são
+mais permissivos que os de `contracts/` (não conferem, por exemplo,
+`message_id`, `session_id` e `sequence`), por isso os testes continuam
+conferindo também os de `contracts/`.
+
 **Estes schemas são um acordo:** o S2 (VER-6) e o S5 (MOD-2) consomem as
 mensagens exatamente como estão aqui. Qualquer mudança é combinada antes com
 os dois; uma mudança que só acrescenta um campo opcional sai como `1.1`, e
